@@ -1,4 +1,4 @@
-# MFAD — Week 1 Technical Documentation
+y# MFAD — Week 1 Technical Documentation
 ### Multimodal Forensic Agent for Deepfake Detection (Image-Only)
 
 **Target output:** A forensic report identical in structure to `DeepFake_Forensic_Report_DFA2025TC00471.pdf`  
