@@ -1,0 +1,101 @@
+{
+  "stub_mode": true,
+  "fusion_weights": {
+    "geometry": 0.15,
+    "frequency": 0.25,
+    "texture": 0.2,
+    "biological": 0.15,
+    "vlm": 0.2,
+    "metadata": 0.05
+  },
+  "verdict_thresholds": {
+    "fake": 0.65,
+    "real": 0.35
+  },
+  "models": {
+    "efficientnet": "models/efficientnet_ff++.pth",
+    "fusion_mlp": "models/fusion_mlp.pth",
+    "blip2": "Salesforce/blip2-opt-2.7b",
+    "dlib_68pt": "models/shape_predictor_68_face_landmarks.dat"
+  },
+  "output": {
+    "report_dir": "reports/",
+    "temp_dir": "temp/",
+    "log_dir": "logs/",
+    "report_id_prefix": "DFA"
+  },
+  "preprocessing": {
+    "target_size": 224,
+    "min_face_size_px": 64,
+    "mediapipe_confidence": 0.7,
+    "fallback_to_dlib": true
+  },
+  "frequency_agent": {
+    "image_size": 224,
+    "fft_bands": {
+      "low_pct": 0.15,
+      "mid_pct": 0.5,
+      "high_pct": 0.75
+    },
+    "fft_thresholds": {
+      "mid_expected_offset": -24.1,
+      "high_expected_offset": -36.6,
+      "ultra_expected_offset": -55.0,
+      "normalization_factor": 10.0
+    },
+    "dct_thresholds": {
+      "real_hf_ratio_min": 0.08,
+      "fake_hf_ratio_max": 0.35,
+      "block_size": 8
+    },
+    "submethod_weights": {
+      "fft": 0.55,
+      "dct": 0.45
+    }
+  },
+  "geometry_agent": {
+    "symmetry_weight": 0.35,
+    "landmark_weight": 0.25,
+    "eye_distance_weight": 0.2,
+    "jaw_weight": 0.2
+  },
+  "texture_agent": {
+    "lbp_radius": 3,
+    "lbp_n_points": 24,
+    "gabor_orientations": 4,
+    "gabor_scales": 3,
+    "smoothness_patch_size": 16
+  },
+  "biological_agent": {
+    "rppg_roi_regions": [
+      "cheek_left",
+      "cheek_right",
+      "forehead"
+    ],
+    "corneal_blob_min_area": 5,
+    "corneal_blob_max_area": 200
+  },
+  "vlm_agent": {
+    "model": "Salesforce/blip2-opt-2.7b",
+    "max_new_tokens": 200,
+    "gradcam_layer": "layer4",
+    "gpu_required": true,
+    "graceful_degrade_to_caption": true
+  },
+  "metadata_agent": {
+    "ela_quality": 90,
+    "ela_scale": 10,
+    "prnu_patch_size": 64
+  },
+  "timeouts_seconds": {
+    "preprocessing": 30,
+    "geometry": 15,
+    "frequency": 30,
+    "texture": 30,
+    "biological": 60,
+    "vlm": 120,
+    "metadata": 15,
+    "fusion": 10,
+    "report": 60
+  }
+}
