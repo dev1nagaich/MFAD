@@ -4,7 +4,6 @@ y# MFAD — Week 1 Technical Documentation
 **Target output:** A forensic report identical in structure to `DeepFake_Forensic_Report_DFA2025TC00471.pdf`  
 **Stack:** LangChain · HuggingFace · PyTorch · OpenCV · ReportLab · Ollama (Mistral-7B)  
 **Rule:** Every agent returns a Python `dict` with an `anomaly_score` key (float 0–1). No exceptions.
-
 ---
 
 ## Table of Contents
