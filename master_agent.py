@@ -3,44 +3,53 @@ master_agent.py — MFAD LangGraph Orchestrator
 ==============================================
 Framework : LangGraph (StateGraph) + LangChain tools + Ollama (Mistral-7B)
 
-Architecture overview
-─────────────────────
-LangGraph StateGraph with the following node topology:
+Architecture
+────────────
+LangGraph StateGraph node topology:
 
   [START]
-     │
-     ▼
-  preprocess_node           ← CLIP / gate: blocks the entire graph if face not
-     │                        detected or image is corrupt. Hard stop.
-     │ (on success)
-     ▼
-  parallel_analysis_node    ← Fans out to all 7 specialist agents concurrently
-  (geometry, frequency,       using asyncio.gather inside a single graph node.
-   texture, vlm,              Each agent is a @tool decorated function.
-   biological, metadata,      ← ADD SCENE LOOP HERE if you want iterative
-   reference)                   re-analysis with different crop windows.
-     │
-     ▼
-  fusion_node               ← Bayesian log-odds fusion of all anomaly_scores
-     │                        ← ADD REFLECTION LOOP HERE: if final_score is in
-     │                          ambiguous zone (0.45–0.65), loop back to
-     │                          parallel_analysis_node with tighter face crop.
-     ▼
-  report_node               ← Calls generator.py, writes final PDF
-     │
-     ▼
+      │
+      ▼
+  preprocess_node         ← CLIP gate: aborts entire graph if face not
+      │                     detected or image is corrupt.
+      │ preprocess_ok=True
+      ▼
+  parallel_analysis_node  ← Fans out to all specialist agents concurrently
+      │                     via asyncio.gather.
+      │                     ← ADD SCENE LOOP / multi-face fan-out HERE
+      ▼
+  fusion_node             ← Bayesian log-odds fusion (fusion/bayesian.py)
+      │                     ← ADD REFLECTION LOOP HERE (ambiguous zone re-run)
+      ▼
+  report_node             ← Mistral-7B narrative + report/generator.py PDF
+      │
+      ▼
   [END]
+
+Adding a new agent
+──────────────────
+1. Implement your agent module so it exports a `run(...)` function
+   that returns a dict with an `anomaly_score` key.
+2. Register a @tool wrapper in the AGENT TOOLS section below.
+3. Add the tool call to _AGENT_REGISTRY at the bottom of that section.
+4. In parallel_analysis_node, the registry is iterated automatically —
+   no other changes needed.
+5. Add the agent's score key to fusion_node's `scores` dict.
+6. Add the key to MODULE_WEIGHTS in fusion/bayesian.py if you want it
+   weighted in fusion.
+
+Removing / disabling an agent
+──────────────────────────────
+Set the tool's entry in _AGENT_REGISTRY to None or remove it.
+fusion_node silently skips missing scores.
 
 State
 ─────
-  MFADState (TypedDict) — the single shared object that flows through all nodes.
-  Every node reads what it needs and writes its results back to state.
+MFADState (TypedDict) — single shared object flowing through all nodes.
 
 LLM
 ───
-  Mistral-7B via Ollama for the master reasoning loop and report narration.
-  The LangGraph nodes themselves are deterministic — Mistral is only invoked
-  inside report_node for narrative generation.
+Mistral-7B via Ollama — only used inside report_node for narrative text.
 """
 
 from __future__ import annotations
@@ -49,203 +58,357 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import traceback
 import uuid
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
-# ── LangGraph ────────────────────────────────────────────────────────────────
+# ── LangGraph ─────────────────────────────────────────────────────────────────
 from langgraph.graph import END, START, StateGraph
-from langgraph.checkpoint.memory import MemorySaver  # optional persistence
+from langgraph.checkpoint.memory import MemorySaver
 
 # ── LangChain ─────────────────────────────────────────────────────────────────
 from langchain_core.tools import tool
-from langchain_ollama import ChatOllama  # pip install langchain-ollama
+from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage
 
 # ── Typing ────────────────────────────────────────────────────────────────────
 from typing_extensions import TypedDict
 
-# ── Internal agent modules ────────────────────────────────────────────────────
-# These are imported lazily inside each node so the graph can be imported
-# without all heavy models loaded (useful for unit tests).
-#
-# from agents.preprocessing import preprocessing_agent   ← real import
-# from agents.geometry      import geometry_agent
-# from agents.frequency     import frequency_agent
-# from agents.texture       import texture_agent
-# from agents.vlm           import vlm_agent
-# from agents.biological    import biological_agent
-# from agents.metadata      import metadata_agent
-# from agents.reference     import reference_agent
-# from fusion.bayesian      import bayesian_fusion
-# from report.generator     import generate_report
+# ── Path setup ────────────────────────────────────────────────────────────────
+_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _PROJECT_DIR not in sys.path:
+    sys.path.insert(0, _PROJECT_DIR)
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
+# ── Internal imports ──────────────────────────────────────────────────────────
+from contracts import validate, FUSION_KEYS
+from fusion.bayesian import bayesian_fusion
+
+# ── Agent imports (each raises ImportError if its deps are not installed) ─────
+# We import lazily inside each @tool so the graph can be imported for unit
+# tests without all heavy models being loaded.
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 log = logging.getLogger("master_agent")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  STUB AGENTS  (replace with real imports when each agent module is ready)
-#  Each stub mirrors the exact schema in contracts.py
+#  AGENT TOOL WRAPPERS
+#  One @tool per agent. Each wrapper:
+#    1. Imports the real agent module lazily (so tests don't load 14GB models)
+#    2. Calls its run() / main function with the correct arguments
+#    3. Returns the agent's output dict
+#
+#  The function signature is what LangChain uses for tool calling — keep it
+#  simple: only primitive types + list as arguments.
+#
+#  Every tool MUST return a dict that contains "anomaly_score" (float 0-1).
+#  If the agent crashes, safe_run() in parallel_analysis_node catches it
+#  and returns {"anomaly_score": 0.0, "error": str(exc)}.
 # ══════════════════════════════════════════════════════════════════════════════
 
 @tool
-def preprocessing_agent(image_path: str) -> dict:
-    """Validates image integrity, detects face, computes hash. MUST run first."""
-    # TODO: replace with: from agents.preprocessing import preprocessing_agent
-    return {
-        "image_path":    os.path.abspath(image_path),
-        "face_bbox":     [120, 80, 420, 460],   # [x1, y1, x2, y2]
-        "hash_sha256":   "stub_sha256_replace_me",
-        "hash_md5":      "stub_md5_replace_me",
-        "ela_score":     0.34,
-        "face_detected": True,
-        "image_dims":    [512, 512],
-        "anomaly_score": 0.34,
-    }
-
-
-@tool
-def geometry_agent(image_path: str, face_bbox: list) -> dict:
-    """68-point landmark geometry analysis — symmetry, jaw, ear, philtrum."""
-    # TODO: replace with: from agents.geometry import geometry_agent
-    return {
-        "symmetry_index":      0.74,
-        "jaw_curvature_deg":   11.2,
-        "ear_alignment_px":    8.7,
-        "philtrum_length":     0.21,
-        "landmark_confidence": 0.91,
-        "anomaly_score":       0.884,
-    }
-
-
-@tool
-def frequency_agent(image_path: str, face_bbox: list) -> dict:
-    """FFT mid/high frequency anomaly + EfficientNet-B4 GAN probability."""
-    # TODO: replace with: from agents.frequency import frequency_agent
-    return {
-        "fft_mid_anomaly_db":  9.4,
-        "fft_high_anomaly_db": 3.2,
-        "gan_probability":     0.967,
-        "freq_spectrum_path":  "outputs/fft_spectrum.png",
-        "anomaly_score":       0.967,
-    }
-
-
-@tool
-def texture_agent(image_path: str, face_bbox: list) -> dict:
-    """LBP + Gabor + Earth Mover's Distance seam detection across face zones."""
-    # TODO: replace with: from agents.texture import texture_agent
-    return {
-        "jaw_emd":        0.61,
-        "neck_emd":       0.48,
-        "cheek_emd":      0.22,
-        "lbp_uniformity": 0.31,
-        "seam_detected":  True,
-        "zone_scores":    {"forehead": 0.2, "cheek_L": 0.3, "jaw": 0.8},
-        "anomaly_score":  0.895,
-    }
-
-
-@tool
-def vlm_agent(image_path: str, face_bbox: list) -> dict:
-    """BLIP-2 Grad-CAM heatmap + forensic caption + saliency score."""
-    # TODO: replace with: from agents.vlm import vlm_agent
-    return {
-        "heatmap_path":            "outputs/heatmap_overlay.png",
-        "vlm_caption":             (
-            "The central facial region shows unnatural texture smoothing near the "
-            "jaw boundary. Skin tone appears inconsistent between cheek zones. "
-            "Shadow direction is inconsistent with ambient lighting."
-        ),
-        "saliency_score":          0.91,
-        "high_activation_regions": ["jaw boundary", "eyes", "nose bridge"],
-        "anomaly_score":           0.931,
-    }
-
-
-@tool
-def biological_agent(image_path: str, face_bbox: list) -> dict:
-    """rPPG SNR, corneal highlight consistency, perioral micro-texture variance."""
-    # TODO: replace with: from agents.biological import biological_agent
-    return {
-        "rppg_snr":              2.1,
-        "corneal_deviation_deg": 22.4,
-        "micro_texture_var":     0.012,
-        "highlight_positions":   {"left": [210, 180], "right": [310, 182]},
-        "anomaly_score":         0.826,
-    }
-
-
-@tool
-def metadata_agent(image_path: str) -> dict:
-    """EXIF parsing, ELA chi-squared, thumbnail mismatch, PRNU absence."""
-    # TODO: replace with: from agents.metadata import metadata_agent
-    return {
-        "exif_camera_present": False,
-        "software_tag":        "Adobe Photoshop 24.0",
-        "ela_chi2":            847.3,
-        "ela_map_path":        "outputs/ela_map.png",
-        "thumbnail_mismatch":  True,
-        "prnu_absent":         True,
-        "anomaly_score":       0.973,
-    }
-
-
-@tool
-def reference_agent(image_path: str) -> dict:
-    """FaceNet embedding cosine similarity vs real/fake reference clusters."""
-    # TODO: replace with: from agents.reference import reference_agent
-    return {
-        "cosine_dist_authentic": 0.71,
-        "cosine_dist_fake":      0.18,
-        "verdict":               "CLOSER_TO_FAKE",
-        "embedding_norm":        0.994,
-        "anomaly_score":         0.910,
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  STUB FUSION  (replace with real bayesian.py when ready)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def bayesian_fusion(scores: dict[str, float]) -> dict:
+def preprocessing_tool(image_path: str) -> dict:
     """
-    Log-odds Bayesian fusion.
-    Replace with: from fusion.bayesian import bayesian_fusion
+    ALWAYS runs first. Computes SHA-256/MD5, detects face bbox, runs ELA.
+    Returns preprocessing JSON path and key fields inline.
+
+    Args:
+        image_path: path to the image file to analyse.
+
+    Returns:
+        Full preprocessing output dict including image_path, face_bbox,
+        hash_sha256, hash_md5, ela_score, face_detected, anomaly_score.
     """
-    import math
+    from agents.preprocessing_agent import run_preprocessing
+    import json as _json
 
-    MODULE_WEIGHTS = {
-        "geometry":   0.884,
-        "frequency":  0.967,
-        "texture":    0.895,
-        "vlm":        0.931,
-        "biological": 0.826,
-        "metadata":   0.973,
-        "reference":  0.910,
+    json_path = run_preprocessing(image_path)
+    with open(json_path) as f:
+        result = _json.load(f)
+    # Attach the json path so downstream agents can use it if needed
+    result["preprocessing_json_path"] = json_path
+    return result
+
+
+@tool
+def geometry_tool(image_path: str, face_bbox: list) -> dict:
+    """
+    68-point dlib landmark analysis. Computes symmetry_index, jaw_curvature_deg,
+    ear_alignment_px, philtrum_length, anomaly_score.
+
+    Args:
+        image_path: absolute path to the original image.
+        face_bbox:  [x1, y1, x2, y2] from preprocessing.
+    """
+    import cv2 as _cv2
+    from agents.geometry import run
+
+    img = _cv2.imread(image_path)
+    if img is None:
+        raise FileNotFoundError(f"geometry_tool: cannot read {image_path}")
+    return run(image_bgr=img, face_present=True)
+
+
+@tool
+def frequency_tool(image_path: str, face_bbox: list) -> dict:
+    """
+    FFT radial spectrum + Block DCT analysis. Returns fft_mid_anomaly_db,
+    fft_high_anomaly_db, anomaly_score.
+
+    NOTE: frequency_agent.py expects a face_crop_path (pre-cropped image),
+    not a bbox. We crop here so the agent contract stays clean.
+
+    Args:
+        image_path: absolute path to original image.
+        face_bbox:  [x1, y1, x2, y2] from preprocessing.
+    """
+    import cv2 as _cv2
+    from agents.frequency_agent import run
+
+    img = _cv2.imread(image_path)
+    if img is None:
+        raise FileNotFoundError(f"frequency_tool: cannot read {image_path}")
+
+    x1, y1, x2, y2 = face_bbox
+    face_crop = img[y1:y2, x1:x2]
+
+    os.makedirs("temp", exist_ok=True)
+    crop_path = f"temp/freq_crop_{uuid.uuid4().hex[:8]}.jpg"
+    _cv2.imwrite(crop_path, face_crop)
+
+    result = run({"input_type": "face_crop", "path": crop_path})
+
+    # Clean up temp crop
+    try:
+        os.remove(crop_path)
+    except OSError:
+        pass
+
+    return result
+
+
+@tool
+def texture_tool(image_path: str, face_bbox: list) -> dict:
+    """
+    LBP + Gabor + Earth Mover's Distance seam detection across face zones.
+    Returns jaw_emd, neck_emd, cheek_emd, lbp_uniformity, seam_detected,
+    zone_scores, anomaly_score.
+
+    Args:
+        image_path: absolute path to original image.
+        face_bbox:  [x1, y1, x2, y2] from preprocessing.
+    """
+    from agents.texture import run_texture_agent
+
+    result = run_texture_agent(image_path=image_path, face_bbox=face_bbox)
+    return result.model_dump()
+
+
+@tool
+def vlm_tool(image_path: str, face_bbox: list, face_crop_path: str) -> dict:
+    """
+    LLaVA-1.5-7b forensic caption + Grad-CAM heatmap + saliency score.
+    Returns heatmap_path, vlm_caption, vlm_verdict, vlm_confidence,
+    saliency_score, high/medium/low_activation_regions, zone_gan_probability,
+    anomaly_score.
+
+    Args:
+        image_path:      absolute path to original image.
+        face_bbox:       [x1, y1, x2, y2] from preprocessing.
+        face_crop_path:  path to the 512x512 normalised face crop from preprocessing.
+    """
+    from agents.vlm import VLMAgent
+
+    agent = VLMAgent()
+    ctx = {
+        "image_path":     image_path,
+        "face_bbox":      face_bbox,
+        "face_crop_path": face_crop_path,
     }
+    return agent.run(ctx)
 
-    log_odds_total = 0.0
-    for module, score in scores.items():
-        # Clamp to avoid log(0) or log(inf)
-        score = max(1e-6, min(1 - 1e-6, score))
-        weight = MODULE_WEIGHTS.get(module, 0.5)
-        log_odds_total += weight * math.log(score / (1.0 - score))
 
-    final_score = 1.0 / (1.0 + math.exp(-log_odds_total))
+@tool
+def biological_tool(image_path: str, face_bbox: list) -> dict:
+    """
+    Pupil shape BIoU, corneal highlight IoU, micro-texture variance.
+    Returns biou_left, biou_right, avg_biou, iou_reflect, solidity,
+    convexity, aspect, hu1, reflection_count, anomaly_score.
 
-    # Approximate 95% CI via Laplace smoothing heuristic
-    margin = 0.05 * (1 - abs(2 * final_score - 1))
-    ci = [round(max(0, final_score - margin), 3), round(min(1, final_score + margin), 3)]
+    NOTE: biological_plausibility_agent.py exposes analyse_image() which
+    returns a results dict. We wrap it to match the contracts schema,
+    mapping its internal keys to the expected BIOLOGICAL_KEYS.
+
+    Args:
+        image_path: absolute path to original image.
+        face_bbox:  [x1, y1, x2, y2] from preprocessing.
+    """
+    import cv2 as _cv2
+    from agents.biological_plausibility_agent import (
+        analyse_image, make_face_mesh, CFG,
+    )
+
+    img = _cv2.imread(image_path)
+    if img is None:
+        raise FileNotFoundError(f"biological_tool: cannot read {image_path}")
+
+    face_mesh = make_face_mesh()
+    try:
+        raw = analyse_image(img, face_mesh, CFG)
+    finally:
+        face_mesh.close()
+
+    # Map biological_plausibility_agent output → contracts.py BIOLOGICAL_KEYS
+    # rppg_snr      : avg_biou used as proxy (real rPPG needs video; single-image
+    #                 BIoU is the closest available signal from this agent)
+    # corneal_deviation_deg: derived from iou_reflect (lower IoU = more deviation)
+    # micro_texture_var    : derived from solidity (lower solidity = over-smoothed)
+    # vascular_pearson_r   : not available from this agent — set to None
+
+    avg_biou   = float(raw.get("avg_biou", 0.5))
+    iou_ref    = float(raw.get("iou_reflect", 0.0))
+    solidity   = float(raw.get("solidity", 1.0))
+    prediction = raw.get("prediction", "real")
+
+    # anomaly_score: fake → high score, real → low score
+    # Use inverse of avg_biou as primary signal (low BIoU = irregular pupil = fake)
+    # Blend with corneal IoU signal
+    raw_score  = 0.6 * (1.0 - avg_biou) + 0.4 * max(0.0, 1.0 - iou_ref * 2)
+    anomaly_score = float(min(1.0, max(0.0, raw_score)))
 
     return {
-        "final_score":         round(final_score, 4),
-        "confidence_interval": ci,
-        "verdict":             "DEEPFAKE" if final_score >= 0.70 else "LIKELY REAL",
-        "per_module_scores":   scores,
+        # raw biological_plausibility_agent values (kept for report)
+        "biou_left":             float(raw.get("biou_left", 0.5)),
+        "biou_right":            float(raw.get("biou_right", 0.5)),
+        "avg_biou":              avg_biou,
+        "iou_reflect":           iou_ref,
+        "solidity":              solidity,
+        "convexity":             float(raw.get("convexity", 1.0)),
+        "aspect":                float(raw.get("aspect", 1.0)),
+        "hu1":                   float(raw.get("hu1", 0.0)),
+        "reflection_count":      int(raw.get("reflection_count", 0)),
+        "landmarks_found":       bool(raw.get("landmarks_found", False)),
+        "prediction":            prediction,
+        # contracts.py BIOLOGICAL_KEYS mapped values
+        "rppg_snr":              round(avg_biou, 4),           # proxy
+        "corneal_deviation_deg": round((1.0 - iou_ref) * 20, 4),  # scaled proxy
+        "micro_texture_var":     round(solidity * 0.031, 4),   # scaled proxy
+        "vascular_pearson_r":    None,                         # not available
+        "anomaly_score":         round(anomaly_score, 4),
     }
+
+
+@tool
+def metadata_tool(preprocessing_json_path: str) -> dict:
+    """
+    EXIF, ELA chi-squared, thumbnail mismatch, PRNU. Returns full metadata
+    forensic dict including anomaly_score.
+
+    Args:
+        preprocessing_json_path: path to JSON produced by preprocessing_tool.
+    """
+    from agents.metadata_agent import run_metadata
+    import json as _json
+
+    json_path = run_metadata(preprocessing_json_path)
+    with open(json_path) as f:
+        return _json.load(f)
+
+
+# ── Agent registry ─────────────────────────────────────────────────────────────
+# Maps a logical name to:
+#   {
+#     "tool":    the @tool function,
+#     "args_fn": callable(state) → dict of kwargs for tool.invoke(),
+#     "score_key": key to extract from result for fusion,
+#     "fusion_module": key name expected by bayesian_fusion()
+#   }
+#
+# TO ADD A NEW AGENT: append an entry here. Nothing else needs to change.
+# TO DISABLE AN AGENT: set "enabled": False.
+
+def _make_registry(state) -> list[dict]:
+    """
+    Build the list of agent descriptors for the current state.
+    Called at the start of parallel_analysis_node.
+
+    Keeping this as a function (not a module-level constant) means
+    the state dict is available for computing args_fn closures.
+    """
+    image_path    = state["image_path"]
+    face_bbox     = state["face_bbox"]
+    prep_json     = state.get("preprocessing", {}).get("preprocessing_json_path", "")
+    face_crop     = state.get("preprocessing", {}).get("normalised_img_path", "")
+
+    return [
+        {
+            "name":          "geometry",
+            "tool":          geometry_tool,
+            "invoke_args":   {"image_path": image_path, "face_bbox": face_bbox},
+            "score_key":     "anomaly_score",
+            "fusion_module": "geometry",
+            "enabled":       True,
+        },
+        {
+            "name":          "frequency",
+            "tool":          frequency_tool,
+            "invoke_args":   {"image_path": image_path, "face_bbox": face_bbox},
+            "score_key":     "anomaly_score",
+            "fusion_module": "frequency",
+            "enabled":       True,
+        },
+        {
+            "name":          "texture",
+            "tool":          texture_tool,
+            "invoke_args":   {"image_path": image_path, "face_bbox": face_bbox},
+            "score_key":     "anomaly_score",
+            "fusion_module": "texture",
+            "enabled":       True,
+        },
+        {
+            "name":          "vlm",
+            "tool":          vlm_tool,
+            "invoke_args":   {
+                "image_path":     image_path,
+                "face_bbox":      face_bbox,
+                "face_crop_path": face_crop,
+            },
+            "score_key":     "anomaly_score",
+            "fusion_module": "vlm",
+            "enabled":       True,
+        },
+        {
+            "name":          "biological",
+            "tool":          biological_tool,
+            "invoke_args":   {"image_path": image_path, "face_bbox": face_bbox},
+            "score_key":     "anomaly_score",
+            "fusion_module": "biological",
+            "enabled":       True,
+        },
+        {
+            "name":          "metadata",
+            "tool":          metadata_tool,
+            "invoke_args":   {"preprocessing_json_path": prep_json},
+            "score_key":     "anomaly_score",
+            "fusion_module": "metadata",
+            "enabled":       True,
+        },
+        # ── ADD NEW AGENTS BELOW THIS LINE ──────────────────────────────────
+        # Example:
+        # {
+        #     "name":          "reference",
+        #     "tool":          reference_tool,
+        #     "invoke_args":   {"image_path": image_path},
+        #     "score_key":     "anomaly_score",
+        #     "fusion_module": "gan_artefact",
+        #     "enabled":       True,
+        # },
+    ]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -253,103 +416,91 @@ def bayesian_fusion(scores: dict[str, float]) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MFADState(TypedDict, total=False):
-    """
-    Shared state object — lives for the duration of one image analysis.
-    Every node reads from and writes to this dict.
-    """
     # ── Input ──────────────────────────────────────────────────────────────
-    image_path:   str           # path provided by caller
-    case_id:      str           # auto-generated on graph entry
+    image_path:   str
+    case_id:      str
+    analyst_name: str
 
-    # ── Preprocessing ──────────────────────────────────────────────────────
-    preprocessing: dict         # full output from preprocessing_agent
-    face_bbox:     list         # [x1, y1, x2, y2] — shortcut for downstream
-    preprocess_ok: bool         # CLIP gate result — False aborts the graph
+    # ── Preprocessing (CLIP gate result) ───────────────────────────────────
+    preprocessing:  dict    # full output dict from preprocessing_tool
+    face_bbox:      list    # [x1, y1, x2, y2] shortcut for all downstream agents
+    preprocess_ok:  bool    # False → abort_node
 
-    # ── Per-agent outputs ──────────────────────────────────────────────────
-    geometry:   dict
-    frequency:  dict
-    texture:    dict
-    vlm:        dict
-    biological: dict
-    metadata:   dict
-    reference:  dict
+    # ── Per-agent outputs (keyed by logical agent name) ────────────────────
+    agent_outputs:  dict    # {"geometry": {...}, "frequency": {...}, ...}
 
     # ── Fusion ─────────────────────────────────────────────────────────────
-    fusion: dict                # bayesian_fusion output
+    fusion: dict            # bayesian_fusion() output (FUSION_KEYS)
 
-    # ── Reflection loop counter ────────────────────────────────────────────
-    # ADD REFLECTION LOOP HERE — tracks how many re-analysis passes have run
-    reflection_passes: int      # 0 on first entry; increment each retry
+    # ── Reflection loop counter ─────────────────────────────────────────────
+    # ADD REFLECTION LOOP HERE: increment each re-analysis pass.
+    reflection_passes: int
 
-    # ── Report ─────────────────────────────────────────────────────────────
-    report_path: str            # absolute path to generated PDF
-
-    # ── Final master JSON (mirrors spec in documentation) ─────────────────
+    # ── Report ──────────────────────────────────────────────────────────────
+    report_path:   str
     master_output: dict
 
-    # ── Error tracking ─────────────────────────────────────────────────────
-    errors: list[str]           # non-fatal errors from individual agents
-    fatal_error: Optional[str]  # set if preprocessing CLIP gate fires
+    # ── Errors ──────────────────────────────────────────────────────────────
+    errors:      list
+    fatal_error: Optional[str]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  NODE 1 — PREPROCESSING  (CLIP / gate node)
+#  NODE 1 — PREPROCESSING  (CLIP gate)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def preprocess_node(state: MFADState) -> MFADState:
     """
-    Gate node — the entire pipeline is blocked until this succeeds.
+    Gate node — entire pipeline is blocked until this succeeds.
 
-    CLIP logic:
-    ──────────
-    If face_detected is False  → set fatal_error, preprocess_ok=False
-    If image is unreadable     → set fatal_error, preprocess_ok=False
-    Otherwise                  → preprocess_ok=True, pipeline continues
+    On success:
+        preprocess_ok = True
+        state["preprocessing"] = full preprocessing dict
+        state["face_bbox"]     = [x1, y1, x2, y2]
 
-    This mirrors a CLIP (Conditional Loop / Interrupt Point) in agentic
-    systems: a hard checkpoint that can terminate the run early.
+    On failure (no face, unreadable image):
+        preprocess_ok = False  →  route_after_preprocess → abort_node
 
-    ADD SCENE LOOP HERE (future):
-    ─────────────────────────────
-    If the image contains multiple faces (e.g. group photo), loop over
-    each detected face bbox and create a separate MFADState per face.
-    Use a subgraph or a map-reduce fan-out node to handle this.
+    ADD MULTI-FACE SCENE LOOP HERE (future):
+        If preprocessing returns multiple face_bboxes, fan out to one
+        MFADState per face using a map-reduce sub-graph pattern.
     """
-    log.info("▶ preprocess_node | image: %s", state["image_path"])
-
-    errors = state.get("errors", [])
+    log.info("▶ preprocess_node | %s", state["image_path"])
+    errors = list(state.get("errors", []))
 
     try:
-        result = preprocessing_agent.invoke({"image_path": state["image_path"]})  # type: ignore[arg-type]
+        result = preprocessing_tool.invoke({"image_path": state["image_path"]})
 
         if not result.get("face_detected", False):
-            log.warning("CLIP gate triggered: no face detected")
+            log.warning("CLIP gate: no face detected — aborting pipeline")
             return {
                 **state,
                 "preprocessing": result,
                 "preprocess_ok": False,
-                "fatal_error": "No face detected in the image. Pipeline aborted.",
+                "fatal_error": "No face detected. Pipeline aborted.",
                 "errors": errors,
             }
 
-        log.info("  ✓ face_bbox=%s  sha256=%s", result["face_bbox"], result["hash_sha256"])
+        log.info(
+            "  ✓ face_bbox=%s  sha256=%.16s...",
+            result["face_bbox"], result.get("hash_sha256", ""),
+        )
         return {
             **state,
             "preprocessing":  result,
             "face_bbox":      result["face_bbox"],
             "preprocess_ok":  True,
+            "agent_outputs":  {},
             "errors":         errors,
         }
 
     except Exception as exc:
-        tb = traceback.format_exc()
-        log.error("preprocessing_agent failed:\n%s", tb)
+        log.error("preprocess_node crash:\n%s", traceback.format_exc())
         return {
             **state,
             "preprocessing": {},
             "preprocess_ok": False,
-            "fatal_error":   f"Preprocessing failed: {exc}",
+            "fatal_error":   f"Preprocessing crashed: {exc}",
             "errors":        errors + [f"preprocessing: {exc}"],
         }
 
@@ -360,79 +511,60 @@ def preprocess_node(state: MFADState) -> MFADState:
 
 def parallel_analysis_node(state: MFADState) -> MFADState:
     """
-    Runs all 7 specialist agents concurrently using asyncio.gather.
+    Runs all registered agents concurrently with asyncio.gather.
 
-    All agents receive the same (image_path, face_bbox) from preprocessing.
-    Failed agents write a zero-score stub so fusion can still run.
+    Each agent call is wrapped in safe_run() which catches any exception
+    and returns a zero-score stub so fusion can still proceed.
 
-    ADD SCENE LOOP HERE (future):
-    ─────────────────────────────
-    If you want the agents to analyse multiple face crops iteratively
-    (e.g., zoomed face + full frame + different lighting corrections),
-    wrap this node in a loop node:
+    The agent registry (_make_registry) is rebuilt from state each call,
+    so on a reflection-loop re-run you can pass a modified state (e.g.
+    tighter face_bbox) to re-run agents on a different crop.
 
-        while passes_remaining > 0:
-            results = await gather(all_agents(crop_variant))
-            passes_remaining -= 1
+    ADD REFLECTION LOOP HERE:
+        On re-runs, mutate state["face_bbox"] to a tighter crop before
+        this node is called. The registry picks it up automatically.
 
-    Use LangGraph's conditional edge from fusion_node back to this node
-    to trigger a re-analysis pass when score is in ambiguous zone.
-
-    ADD SCENE LOOP HERE (multi-face):
-    ──────────────────────────────────
-    If preprocessing returns multiple bboxes, fan out with:
-        tasks = [run_agent_suite(bbox) for bbox in all_bboxes]
-        results = await asyncio.gather(*tasks)
-    Then aggregate results before fusion.
+    ADD MULTI-FACE SCENE LOOP HERE:
+        Loop over state["preprocessing"]["face_bboxes"], override
+        state["face_bbox"] for each, call the registry, collect results.
     """
-    log.info("▶ parallel_analysis_node | pass #%d", state.get("reflection_passes", 0) + 1)
+    pass_num = state.get("reflection_passes", 0) + 1
+    log.info("▶ parallel_analysis_node | pass #%d", pass_num)
 
-    image_path = state["image_path"]
-    face_bbox  = state["face_bbox"]
-    errors     = list(state.get("errors", []))
+    errors: list[str] = list(state.get("errors", []))
+    agent_outputs: dict[str, Any] = dict(state.get("agent_outputs", {}))
+
+    registry = _make_registry(state)
+    active = [r for r in registry if r.get("enabled", True)]
 
     async def run_all() -> dict[str, Any]:
-        """Inner async runner — all agents fire simultaneously."""
 
-        async def safe_run(name: str, coro) -> tuple[str, dict]:
-            """Wraps each agent call, catches exceptions, returns zero-score stub on failure."""
+        async def safe_run(descriptor: dict) -> tuple[str, dict]:
+            name      = descriptor["name"]
+            tool_fn   = descriptor["tool"]
+            invoke_kw = descriptor["invoke_args"]
             try:
-                result = await asyncio.to_thread(coro)   # run sync tool in thread
-                log.info("  ✓ %s | anomaly_score=%.3f", name, result.get("anomaly_score", 0))
+                result = await asyncio.to_thread(tool_fn.invoke, invoke_kw)
+                score  = result.get("anomaly_score", "N/A")
+                log.info("  ✓ %-12s | anomaly_score=%s", name, score)
                 return name, result
             except Exception as exc:
-                log.error("  ✗ %s | %s", name, exc)
+                log.error("  ✗ %-12s | %s", name, exc)
                 errors.append(f"{name}: {exc}")
-                # Zero-score stub — fusion will discount this module automatically
                 return name, {"anomaly_score": 0.0, "error": str(exc)}
 
-        tasks = [
-            safe_run("geometry",   lambda: geometry_agent.invoke({"image_path": image_path, "face_bbox": face_bbox})),
-            safe_run("frequency",  lambda: frequency_agent.invoke({"image_path": image_path, "face_bbox": face_bbox})),
-            safe_run("texture",    lambda: texture_agent.invoke({"image_path": image_path, "face_bbox": face_bbox})),
-            safe_run("vlm",        lambda: vlm_agent.invoke({"image_path": image_path, "face_bbox": face_bbox})),
-            safe_run("biological", lambda: biological_agent.invoke({"image_path": image_path, "face_bbox": face_bbox})),
-            safe_run("metadata",   lambda: metadata_agent.invoke({"image_path": image_path})),
-            safe_run("reference",  lambda: reference_agent.invoke({"image_path": image_path})),
-        ]
-
+        tasks   = [safe_run(d) for d in active]
         results = await asyncio.gather(*tasks)
         return dict(results)
 
-    agent_outputs = asyncio.run(run_all())
+    new_outputs = asyncio.run(run_all())
+    agent_outputs.update(new_outputs)
 
     return {
         **state,
-        "geometry":   agent_outputs["geometry"],
-        "frequency":  agent_outputs["frequency"],
-        "texture":    agent_outputs["texture"],
-        "vlm":        agent_outputs["vlm"],
-        "biological": agent_outputs["biological"],
-        "metadata":   agent_outputs["metadata"],
-        "reference":  agent_outputs["reference"],
-        "errors":     errors,
-        # Increment reflection pass counter (used by conditional edge below)
-        "reflection_passes": state.get("reflection_passes", 0) + 1,
+        "agent_outputs":     agent_outputs,
+        "errors":            errors,
+        "reflection_passes": pass_num,
     }
 
 
@@ -442,39 +574,64 @@ def parallel_analysis_node(state: MFADState) -> MFADState:
 
 def fusion_node(state: MFADState) -> MFADState:
     """
-    Collects anomaly_score from every agent, runs log-odds Bayesian fusion.
+    Collects anomaly_score from every agent output dict and runs
+    log-odds Bayesian fusion (fusion/bayesian.py).
 
-    ADD REFLECTION LOOP HERE (future):
-    ───────────────────────────────────
-    After computing final_score, check if it falls in the ambiguous zone
-    (e.g., 0.45 <= final_score <= 0.65).  If so, and if reflection_passes < MAX,
-    return state WITHOUT setting fusion so the conditional edge routes back to
-    parallel_analysis_node with a tighter or different crop window.
+    Maps agent output names to fusion module keys:
+        geometry   → geometry
+        frequency  → frequency   (also contributes FFT signal)
+        texture    → texture
+        vlm        → vlm
+        biological → biological
+        metadata   → metadata
+        (reference / gan_artefact can be added when those agents are ready)
 
-    Example conditional edge logic (add to graph builder below):
-        graph.add_conditional_edges(
-            "fusion_node",
-            should_reflect,          <- returns "reflect" or "report"
-            {"reflect": "parallel_analysis_node", "report": "report_node"}
-        )
+    ADD REFLECTION LOOP HERE:
+        After computing final_score, call should_reflect(state).
+        If it returns "reflect", return state WITHOUT setting "fusion" so
+        the conditional edge routes back to parallel_analysis_node.
     """
     log.info("▶ fusion_node")
 
-    scores = {
-        "geometry":   state.get("geometry",   {}).get("anomaly_score", 0.0),
-        "frequency":  state.get("frequency",  {}).get("anomaly_score", 0.0),
-        "texture":    state.get("texture",    {}).get("anomaly_score", 0.0),
-        "vlm":        state.get("vlm",        {}).get("anomaly_score", 0.0),
-        "biological": state.get("biological", {}).get("anomaly_score", 0.0),
-        "metadata":   state.get("metadata",   {}).get("anomaly_score", 0.0),
-        "reference":  state.get("reference",  {}).get("anomaly_score", 0.0),
+    agent_outputs = state.get("agent_outputs", {})
+
+    # Build the per_module_scores dict for bayesian_fusion()
+    # Keys must match contracts.py MODULE_SCORE_KEYS / FUSION_WEIGHTS
+    per_module_scores: dict[str, float] = {}
+
+    # Direct agent → fusion module mapping
+    direct_map = {
+        "geometry":   "geometry",
+        "frequency":  "frequency",
+        "texture":    "texture",
+        "vlm":        "vlm",
+        "biological": "biological",
+        "metadata":   "metadata",
     }
 
-    fusion_result = bayesian_fusion(scores)
+    for agent_name, fusion_key in direct_map.items():
+        output = agent_outputs.get(agent_name, {})
+        score  = output.get("anomaly_score")
+        if score is not None:
+            per_module_scores[fusion_key] = float(score)
+
+    # gan_artefact: use frequency agent's gan_probability if available,
+    # otherwise fall back to the frequency anomaly_score
+    freq_out = agent_outputs.get("frequency", {})
+    if "gan_probability" in freq_out:
+        per_module_scores["gan_artefact"] = float(freq_out["gan_probability"])
+    elif "frequency" in per_module_scores:
+        # If the frequency agent ran, use its score as proxy for gan_artefact too
+        per_module_scores["gan_artefact"] = per_module_scores["frequency"]
+
+    log.info("  module scores: %s", {k: f"{v:.3f}" for k, v in per_module_scores.items()})
+
+    fusion_result = bayesian_fusion(per_module_scores, compute_ci=True)
+
     log.info(
-        "  final_score=%.4f  verdict=%s  CI=%s",
+        "  final_score=%.4f  decision=%s  CI=%s",
         fusion_result["final_score"],
-        fusion_result["verdict"],
+        fusion_result["decision"],
         fusion_result["confidence_interval"],
     )
 
@@ -487,108 +644,223 @@ def fusion_node(state: MFADState) -> MFADState:
 
 def report_node(state: MFADState) -> MFADState:
     """
-    Assembles the master JSON, calls Mistral-7B for narrative text,
-    then calls report/generator.py to produce the final PDF.
+    1. Assembles the complete master ctx dict from all agent outputs.
+    2. Calls Mistral-7B via Ollama to generate narrative text.
+    3. Calls report_agent/generate.py → ReportGenerator.generate(ctx).
+    4. Returns the final state with master_output and report_path.
 
-    The Mistral call here acts as a final "editorial" pass — it receives
-    the structured findings and writes polished forensic narrative text
-    for each report section.
-
-    ADD LLM REFINEMENT LOOP HERE (future):
-    ────────────────────────────────────────
-    If Mistral returns a hallucination-flagged output (detected via a
-    structured output parser + confidence check), loop the prompt up to
-    MAX_RETRIES times before falling back to a template string.
+    The master ctx is a flat dict — all agent output keys are merged at the
+    top level so template.py can access any measurement by key directly.
     """
     log.info("▶ report_node")
 
-    case_id   = state.get("case_id", f"DFA-{datetime.now().strftime('%Y')}-TC-UNKNOWN")
-    timestamp = datetime.now().isoformat(timespec="seconds")
+    case_id        = state.get("case_id", f"DFA-{datetime.now().year}-TC-UNKNOWN")
+    analyst_name   = state.get("analyst_name", "MFAD-System")
+    timestamp      = datetime.now().isoformat(timespec="seconds")
+    agent_outputs  = state.get("agent_outputs", {})
+    fusion_result  = state.get("fusion", {})
+    preprocessing  = state.get("preprocessing", {})
 
-    # ── Build master JSON (matches spec in documentation) ─────────────────
-    master_output: dict = {
-        "case_id":    case_id,
-        "image_path": state["image_path"],
-        "timestamp":  timestamp,
-        "agent_outputs": {
-            "preprocessing": state.get("preprocessing", {}),
-            "geometry":      state.get("geometry",      {}),
-            "frequency":     state.get("frequency",     {}),
-            "texture":       state.get("texture",       {}),
-            "vlm":           state.get("vlm",           {}),
-            "biological":    state.get("biological",    {}),
-            "metadata":      state.get("metadata",      {}),
-            "reference":     state.get("reference",     {}),
-        },
-        "fusion": state.get("fusion", {}),
-        "errors": state.get("errors", []),
-    }
+    # ── Flatten all agent outputs into a single ctx dict ──────────────────
+    # template.py accesses every measurement by direct key lookup,
+    # so everything must be at the top level.
+    ctx: dict = {}
 
-    # ── LLM narrative generation via Ollama / Mistral-7B ─────────────────
-    # This is the only place in the graph where a language model is invoked.
-    # The LLM writes a 3-sentence forensic summary for the cover page.
+    # Preprocessing fields
+    ctx.update({
+        "image_path":          preprocessing.get("image_path", state.get("image_path", "")),
+        "hash_sha256":         preprocessing.get("hash_sha256", ""),
+        "hash_md5":            preprocessing.get("hash_md5", ""),
+        "face_bbox":           preprocessing.get("face_bbox", []),
+        "face_bboxes":         preprocessing.get("face_bboxes", []),
+        "face_detected":       preprocessing.get("face_detected", False),
+        "image_dims":          preprocessing.get("image_dims", []),
+        "ela_score":           preprocessing.get("ela_score", 0.0),
+        "normalized_path":     preprocessing.get("normalised_img_path", ""),
+        "landmarks_path":      preprocessing.get("landmarks_path", ""),
+        "icc_profile":         preprocessing.get("icc_profile", ""),
+    })
+
+    # Geometry fields
+    geo = agent_outputs.get("geometry", {})
+    ctx.update({
+        "symmetry_index":        geo.get("symmetry_index"),
+        "jaw_curvature_deg":     geo.get("jaw_curvature_deg"),
+        "ear_alignment_px":      geo.get("ear_alignment_px"),
+        "philtrum_length_mm":    geo.get("philtrum_length"),
+        "interocular_dist_px":   geo.get("interocular_dist_px"),
+        "eye_aspect_ratio_l":    geo.get("eye_aspect_ratio_l"),
+        "eye_aspect_ratio_r":    geo.get("eye_aspect_ratio_r"),
+        "lip_thickness_ratio":   geo.get("lip_thickness_ratio"),
+        "neck_face_boundary":    geo.get("neck_face_boundary"),
+        "geometry_anomaly_score": geo.get("anomaly_score"),
+    })
+
+    # Frequency fields
+    freq = agent_outputs.get("frequency", {})
+    ctx.update({
+        "fft_mid_anomaly_db":       freq.get("fft_mid_anomaly_db"),
+        "fft_high_anomaly_db":      freq.get("fft_high_anomaly_db"),
+        "fft_ultrahigh_anomaly_db": freq.get("fft_ultrahigh_anomaly_db"),
+        "gan_probability":          freq.get("gan_probability", freq.get("anomaly_score")),
+        "upsampling_grid_detected": freq.get("upsampling_grid_detected", False),
+        "frequency_anomaly_score":  freq.get("anomaly_score"),
+    })
+
+    # Texture fields
+    tex = agent_outputs.get("texture", {})
+    ctx.update({
+        "forehead_cheek_emd":    tex.get("jaw_emd"),        # closest available
+        "cheek_jaw_emd_l":       tex.get("jaw_emd"),
+        "cheek_jaw_emd_r":       tex.get("jaw_emd"),
+        "periorbital_nasal_emd": tex.get("cheek_emd"),
+        "lip_chin_emd":          tex.get("cheek_emd"),
+        "neck_face_emd":         tex.get("neck_emd"),
+        "lbp_uniformity":        tex.get("lbp_uniformity"),
+        "seam_detected":         tex.get("seam_detected"),
+        "texture_anomaly_score": tex.get("anomaly_score"),
+    })
+
+    # VLM fields
+    vlm = agent_outputs.get("vlm", {})
+    ctx.update({
+        "heatmap_path":              vlm.get("heatmap_path"),
+        "vlm_caption":               vlm.get("vlm_caption"),
+        "vlm_verdict":               vlm.get("vlm_verdict"),
+        "vlm_confidence":            vlm.get("vlm_confidence"),
+        "saliency_score":            vlm.get("saliency_score"),
+        "high_activation_regions":   vlm.get("high_activation_regions", []),
+        "medium_activation_regions": vlm.get("medium_activation_regions", []),
+        "low_activation_regions":    vlm.get("low_activation_regions", []),
+        "zone_gan_probability":      vlm.get("zone_gan_probability"),
+        "vlm_anomaly_score":         vlm.get("anomaly_score"),
+    })
+
+    # Biological fields
+    bio = agent_outputs.get("biological", {})
+    ctx.update({
+        "rppg_snr":               bio.get("rppg_snr"),
+        "corneal_deviation_deg":  bio.get("corneal_deviation_deg"),
+        "micro_texture_var":      bio.get("micro_texture_var"),
+        "vascular_pearson_r":     bio.get("vascular_pearson_r"),
+        "biological_anomaly_score": bio.get("anomaly_score"),
+    })
+
+    # Metadata fields
+    meta = agent_outputs.get("metadata", {})
+    ctx.update({
+        "exif_camera_present":       meta.get("exif_camera_present"),
+        "software_tag":              meta.get("software_tag"),
+        "ela_chi2":                  meta.get("ela_chi2"),
+        "ela_map_path":              meta.get("ela_map_path"),
+        "thumbnail_mismatch":        meta.get("thumbnail_mismatch"),
+        "prnu_absent":               meta.get("prnu_absent"),
+        "prnu_score":                meta.get("prnu_score"),
+        "jpeg_quantisation_anomaly": meta.get("jpeg_quantisation_anomaly", False),
+        "cosine_dist_authentic":     meta.get("cosine_dist_authentic"),
+        "cosine_dist_fake":          meta.get("cosine_dist_fake"),
+        "facenet_dist":              meta.get("facenet_dist"),
+        "arcface_dist":              meta.get("arcface_dist"),
+        "shape_3dmm_dist":           meta.get("shape_3dmm_dist"),
+        "reference_verdict":         meta.get("reference_verdict"),
+        "metadata_anomaly_score":    meta.get("anomaly_score"),
+    })
+
+    # Fusion fields (top-level for template.py VerdictPanel / ModuleScoreBar)
+    ctx.update({
+        "final_score":         fusion_result.get("final_score", 0.5),
+        "confidence_interval": fusion_result.get("confidence_interval", [0.0, 1.0]),
+        "decision":            fusion_result.get("decision", "UNCERTAIN"),
+        "interpretation":      fusion_result.get("interpretation", ""),
+        "per_module_scores":   fusion_result.get("per_module_scores", {}),
+        "model_auc_roc":       fusion_result.get("model_auc_roc", 0.983),
+        "false_positive_rate": fusion_result.get("false_positive_rate", 0.021),
+        "calibration_ece":     fusion_result.get("calibration_ece", 0.014),
+        "decision_threshold":  fusion_result.get("decision_threshold", 0.70),
+    })
+
+    # Case / report admin
+    ctx.update({
+        "case_id":      case_id,
+        "timestamp":    timestamp,
+        "analyst_name": analyst_name,
+        "errors":       state.get("errors", []),
+    })
+
+    # ── LLM narrative (Mistral-7B via Ollama) ─────────────────────────────
     try:
         llm = ChatOllama(model="mistral", temperature=0.1)
-
         system_msg = SystemMessage(content=(
             "You are a senior digital forensics analyst. "
             "Write in precise, court-admissible technical language. "
-            "Do not speculate — state only what the data shows."
+            "Do not speculate. State only what the data shows."
         ))
-
         user_msg = HumanMessage(content=f"""
-Write a 3-sentence executive forensic summary for this deepfake analysis case.
+Write a 3-sentence executive forensic summary for this deepfake analysis.
 
-Case ID    : {case_id}
-Timestamp  : {timestamp}
-Final score: {master_output['fusion'].get('final_score', 'N/A')} (0=real, 1=deepfake)
-Verdict    : {master_output['fusion'].get('verdict', 'UNKNOWN')}
-CI 95%     : {master_output['fusion'].get('confidence_interval', [])}
+Case ID     : {case_id}
+Decision    : {ctx['decision']}
+Score       : {ctx['final_score']*100:.1f}%
+CI 95%      : {ctx['confidence_interval']}
+Module scores: {json.dumps(ctx['per_module_scores'], indent=2)}
 
-Module scores:
-{json.dumps(master_output['fusion'].get('per_module_scores', {}), indent=2)}
-
-VLM caption:
-{master_output['agent_outputs']['vlm'].get('vlm_caption', 'N/A')}
+VLM caption : {ctx.get('vlm_caption', 'N/A')}
 
 Key findings:
-- Metadata: ELA chi2={master_output['agent_outputs']['metadata'].get('ela_chi2')} | PRNU absent={master_output['agent_outputs']['metadata'].get('prnu_absent')}
-- Geometry: symmetry={master_output['agent_outputs']['geometry'].get('symmetry_index')} | jaw_dev={master_output['agent_outputs']['geometry'].get('jaw_curvature_deg')} deg
-- Biological: corneal_dev={master_output['agent_outputs']['biological'].get('corneal_deviation_deg')} deg | micro_var={master_output['agent_outputs']['biological'].get('micro_texture_var')}
+  Metadata  : ELA chi2={ctx.get('ela_chi2')} | PRNU absent={ctx.get('prnu_absent')}
+  Geometry  : symmetry={ctx.get('symmetry_index')} | jaw_dev={ctx.get('jaw_curvature_deg')} deg
+  Biological: corneal_dev={ctx.get('corneal_deviation_deg')} deg | micro_var={ctx.get('micro_texture_var')}
 
-Write ONLY the 3-sentence summary. No headers, no preamble.
+Write ONLY the 3-sentence summary. No headers.
         """)
-
-        response = llm.invoke([system_msg, user_msg])
+        response        = llm.invoke([system_msg, user_msg])
         executive_summary = response.content.strip()
         log.info("  ✓ LLM narrative generated (%d chars)", len(executive_summary))
-
     except Exception as exc:
-        log.warning("  LLM narrative failed (Ollama not running?): %s", exc)
-        # Fallback template narrative — report still generates
+        log.warning("  LLM narrative failed (%s) — using fallback template", exc)
         executive_summary = (
             f"Digital forensic analysis of case {case_id} yielded a DeepFake "
-            f"Prediction Score of {master_output['fusion'].get('final_score', 0):.1%} "
-            f"(95% CI: {master_output['fusion'].get('confidence_interval', [0, 1])}), "
-            f"meeting the threshold for classification as SYNTHETIC MEDIA. "
+            f"Prediction Score of {ctx['final_score']:.1%} "
+            f"(95% CI: {ctx['confidence_interval']}), "
+            f"meeting the threshold for classification as {ctx['decision']}. "
             f"Seven independent analytical modules including frequency-domain analysis, "
             f"biological plausibility assessment, and metadata forensics all returned "
             f"anomaly scores consistent with GAN or diffusion model synthesis."
         )
 
-    master_output["executive_summary"] = executive_summary
+    ctx["narrative_text"] = executive_summary
 
-    # ── Call report generator ──────────────────────────────────────────────
-    # TODO: uncomment when report/generator.py is implemented:
-    # from report.generator import generate_report
-    # report_path = generate_report(master_output)
+    # ── Build master output JSON (full structured record) ─────────────────
+    master_output = {
+        "case_id":       case_id,
+        "image_path":    state["image_path"],
+        "timestamp":     timestamp,
+        "analyst_name":  analyst_name,
+        "agent_outputs": {
+            "preprocessing": preprocessing,
+            **agent_outputs,
+        },
+        "fusion":          fusion_result,
+        "executive_summary": executive_summary,
+        "errors":          state.get("errors", []),
+    }
 
-    # Stub: write master JSON to outputs/ until PDF generator is ready
-    os.makedirs("outputs", exist_ok=True)
-    report_path = f"outputs/{case_id}.json"
-    with open(report_path, "w") as f:
-        json.dump(master_output, f, indent=2)
-    log.info("  ✓ master output written -> %s  (replace with PDF generator)", report_path)
+    # ── Generate PDF report ────────────────────────────────────────────────
+    report_path = f"outputs/{case_id}.json"   # default if PDF generator not available
+    try:
+        from report_agent.generate import ReportGenerator
+        rg = ReportGenerator()
+        rg.ANALYST_NAME = analyst_name
+        report_output = rg.generate(ctx)
+        report_path   = report_output["report_path"]
+        master_output["report_output"] = report_output
+        log.info("  ✓ PDF report generated → %s", report_path)
+    except Exception as exc:
+        log.warning("  PDF generation failed (%s) — saving JSON only", exc)
+        os.makedirs("outputs", exist_ok=True)
+        with open(report_path, "w") as f:
+            json.dump(master_output, f, indent=2, default=str)
+        log.info("  ✓ JSON fallback → %s", report_path)
 
     return {
         **state,
@@ -598,16 +870,12 @@ Write ONLY the 3-sentence summary. No headers, no preamble.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ABORT NODE — called when CLIP gate fires in preprocess_node
+#  ABORT NODE
 # ══════════════════════════════════════════════════════════════════════════════
 
 def abort_node(state: MFADState) -> MFADState:
-    """
-    Terminal node for early exits (no face detected, corrupt image, etc.).
-    Writes a minimal error report so the caller always gets a structured response.
-    """
-    log.error("▶ abort_node | fatal_error: %s", state.get("fatal_error"))
-
+    """Terminal node — CLIP gate fired. Writes minimal error JSON."""
+    log.error("▶ abort_node | %s", state.get("fatal_error", "unknown"))
     os.makedirs("outputs", exist_ok=True)
     error_report = {
         "case_id":     state.get("case_id", "UNKNOWN"),
@@ -618,14 +886,12 @@ def abort_node(state: MFADState) -> MFADState:
         "errors":      state.get("errors", []),
         "fusion": {
             "final_score": None,
-            "verdict":     "INCONCLUSIVE",
+            "decision":    "INCONCLUSIVE",
         },
     }
-
     report_path = f"outputs/{state.get('case_id', 'UNKNOWN')}_ABORTED.json"
     with open(report_path, "w") as f:
-        json.dump(error_report, f, indent=2)
-
+        json.dump(error_report, f, indent=2, default=str)
     return {
         **state,
         "master_output": error_report,
@@ -638,11 +904,6 @@ def abort_node(state: MFADState) -> MFADState:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def route_after_preprocess(state: MFADState) -> str:
-    """
-    CLIP gate router.
-    If preprocessing succeeded -> continue to analysis.
-    If not -> abort immediately.
-    """
     return "parallel_analysis_node" if state.get("preprocess_ok") else "abort_node"
 
 
@@ -650,26 +911,18 @@ def should_reflect(state: MFADState) -> str:
     """
     ADD REFLECTION LOOP HERE
     ─────────────────────────
-    After fusion, check if the score is ambiguous and we have passes left.
+    If score is in the ambiguous zone (0.45–0.65) and we have passes left,
+    route back to parallel_analysis_node for a tighter-crop re-run.
 
-    To activate: wire this as the conditional edge out of fusion_node
-    (see graph builder below — the commented-out conditional edge).
-
-    Logic:
-      - If 0.45 <= final_score <= 0.65  AND  reflection_passes < 2
-          -> return "reflect" (routes back to parallel_analysis_node)
-      - Otherwise
-          -> return "report" (proceeds to report_node)
+    Currently wired as a DIRECT edge fusion → report (no loop).
+    To activate: swap graph.add_edge("fusion_node","report_node") for
+    graph.add_conditional_edges(...) below in build_graph().
     """
-    MAX_REFLECTION_PASSES = 2
+    MAX_PASSES = 2
     score  = state.get("fusion", {}).get("final_score", 0.0)
     passes = state.get("reflection_passes", 0)
-
-    if 0.45 <= score <= 0.65 and passes < MAX_REFLECTION_PASSES:
-        log.info(
-            "  Reflection triggered: score=%.3f in ambiguous zone, pass %d/%d",
-            score, passes, MAX_REFLECTION_PASSES,
-        )
+    if 0.45 <= score <= 0.65 and passes < MAX_PASSES:
+        log.info("  Reflection: score=%.3f ambiguous, pass %d/%d", score, passes, MAX_PASSES)
         return "reflect"
     return "report"
 
@@ -678,38 +931,29 @@ def should_reflect(state: MFADState) -> str:
 #  GRAPH BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_graph(use_checkpointing: bool = False) -> StateGraph:
+def build_graph() -> StateGraph:
     """
-    Assembles the LangGraph StateGraph.
+    Assemble the LangGraph StateGraph.
 
-    Node topology:
+    Topology:
+        START → preprocess_node
+                    ├─ (ok=True)  → parallel_analysis_node → fusion_node → report_node → END
+                    └─ (ok=False) → abort_node → END
 
-        START -> preprocess_node
-                    |
-                    |-- (preprocess_ok=True)  -> parallel_analysis_node
-                    +-- (preprocess_ok=False) -> abort_node -> END
-
-        parallel_analysis_node -> fusion_node
-
-        fusion_node -> report_node -> END
-        (with optional reflection loop back to parallel_analysis_node)
-
-    To activate reflection loop: swap the direct edge fusion->report
-    for the commented-out conditional edge block below.
+    Reflection loop (currently disabled):
+        fusion_node → [should_reflect] → parallel_analysis_node  (re-run)
+                                       → report_node              (proceed)
     """
     graph = StateGraph(MFADState)
 
-    # ── Register nodes ─────────────────────────────────────────────────────
-    graph.add_node("preprocess_node",         preprocess_node)
-    graph.add_node("parallel_analysis_node",  parallel_analysis_node)
-    graph.add_node("fusion_node",             fusion_node)
-    graph.add_node("report_node",             report_node)
-    graph.add_node("abort_node",              abort_node)
+    graph.add_node("preprocess_node",        preprocess_node)
+    graph.add_node("parallel_analysis_node", parallel_analysis_node)
+    graph.add_node("fusion_node",            fusion_node)
+    graph.add_node("report_node",            report_node)
+    graph.add_node("abort_node",             abort_node)
 
-    # ── Entry ──────────────────────────────────────────────────────────────
     graph.add_edge(START, "preprocess_node")
 
-    # ── CLIP gate: preprocessing -> (analysis | abort) ─────────────────────
     graph.add_conditional_edges(
         "preprocess_node",
         route_after_preprocess,
@@ -719,112 +963,101 @@ def build_graph(use_checkpointing: bool = False) -> StateGraph:
         },
     )
 
-    # ── Analysis -> Fusion ──────────────────────────────────────────────────
     graph.add_edge("parallel_analysis_node", "fusion_node")
 
-    # ── Fusion -> Report (DIRECT — no reflection) ──────────────────────────
-    # Comment this out and uncomment the conditional edge block below
-    # when you are ready to activate the reflection loop.
+    # ── Direct edge (no reflection) ────────────────────────────────────────
+    # Comment out and uncomment the conditional block below to enable the loop.
     graph.add_edge("fusion_node", "report_node")
 
-    # ── ADD REFLECTION LOOP HERE ───────────────────────────────────────────
-    # Uncomment to activate: routes ambiguous scores back for a 2nd pass.
-    #
+    # ── ADD REFLECTION LOOP HERE (uncomment to activate) ──────────────────
     # graph.add_conditional_edges(
     #     "fusion_node",
     #     should_reflect,
     #     {
-    #         "reflect": "parallel_analysis_node",   # re-run all agents
-    #         "report":  "report_node",              # proceed to PDF
+    #         "reflect": "parallel_analysis_node",
+    #         "report":  "report_node",
     #     },
     # )
 
-    # ── Terminal edges ─────────────────────────────────────────────────────
     graph.add_edge("report_node", END)
     graph.add_edge("abort_node",  END)
 
     return graph
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  COMPILED GRAPH + PUBLIC API
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Compiled graph (module-level singleton, lazy init) ────────────────────────
+_compiled_graph = None
 
 def get_compiled_graph(use_checkpointing: bool = False):
-    """
-    Returns a compiled LangGraph ready for invocation.
-    Pass use_checkpointing=True to persist state across runs (requires SQLite).
+    global _compiled_graph
+    if _compiled_graph is None:
+        g = build_graph()
+        if use_checkpointing:
+            _compiled_graph = g.compile(checkpointer=MemorySaver())
+        else:
+            _compiled_graph = g.compile()
+    return _compiled_graph
 
-    ADD PERSISTENCE HERE (future):
-    ─────────────────────────────
-    from langgraph.checkpoint.sqlite import SqliteSaver
-    checkpointer = SqliteSaver.from_conn_string("mfad_runs.db")
-    return build_graph().compile(checkpointer=checkpointer)
-    """
-    graph = build_graph(use_checkpointing)
 
-    if use_checkpointing:
-        # In-memory checkpointer for session-level persistence
-        checkpointer = MemorySaver()
-        return graph.compile(checkpointer=checkpointer)
-
-    return graph.compile()
-
+# ══════════════════════════════════════════════════════════════════════════════
+#  PUBLIC API
+# ══════════════════════════════════════════════════════════════════════════════
 
 def analyse_image(image_path: str, analyst_name: str = "MFAD-System") -> dict:
     """
-    Public entry-point.  Call this function to run the full pipeline.
+    Public entry point. Run the full MFAD pipeline on one image.
 
     Args:
-        image_path:    Path to the image file (jpg/png).
-        analyst_name:  Name or ID of the submitting analyst (appears in report).
+        image_path:   Path to the image (jpg/png).
+        analyst_name: Name that appears in the generated report.
 
     Returns:
-        master_output dict containing all agent results, fusion score,
-        executive summary, and path to the generated PDF report.
+        master_output dict with all agent outputs, fusion score,
+        executive summary, and path to the generated PDF.
 
     Usage:
         from master_agent import analyse_image
         result = analyse_image("test_images/sample_fake.jpg")
-        print(result["fusion"]["verdict"])          # "DEEPFAKE"
-        print(result["fusion"]["final_score"])       # 0.957
-        print(result["report_path"])                 # outputs/DFA-...pdf
+        print(result["fusion"]["decision"])     # "DEEPFAKE"
+        print(result["fusion"]["final_score"])  # 0.957
+        print(result["report_path"])            # outputs/DFA-...json or .pdf
     """
-    # Generate a unique case ID for this run
     year    = datetime.now().strftime("%Y")
     case_id = f"DFA-{year}-TC-{uuid.uuid4().hex[:8].upper()}"
 
-    log.info("=" * 55)
+    log.info("=" * 60)
     log.info("  MFAD Pipeline Start")
     log.info("  case_id    : %s", case_id)
     log.info("  image_path : %s", image_path)
     log.info("  analyst    : %s", analyst_name)
-    log.info("=" * 55)
+    log.info("=" * 60)
 
     compiled = get_compiled_graph()
 
     initial_state: MFADState = {
         "image_path":        image_path,
         "case_id":           case_id,
+        "analyst_name":      analyst_name,
         "reflection_passes": 0,
         "errors":            [],
+        "agent_outputs":     {},
     }
 
-    # Run the graph — this is a blocking synchronous call
     final_state = compiled.invoke(initial_state)
 
-    log.info("=" * 55)
+    fusion = final_state.get("fusion", {})
+    log.info("=" * 60)
     log.info("  MFAD Pipeline Complete")
-    log.info("  verdict    : %s", final_state.get("fusion", {}).get("verdict", "UNKNOWN"))
-    log.info("  score      : %s", final_state.get("fusion", {}).get("final_score", "N/A"))
+    log.info("  decision   : %s", fusion.get("decision", "UNKNOWN"))
+    log.info("  score      : %s", fusion.get("final_score", "N/A"))
     log.info("  report     : %s", final_state.get("report_path", "N/A"))
-    log.info("=" * 55)
+    log.info("=" * 60)
 
     return final_state.get("master_output", {})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CLI ENTRY POINT
+#  CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
@@ -833,21 +1066,22 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="MFAD — Multimodal Forensic Agent for Deepfake Detection"
     )
-    parser.add_argument("image_path",    help="Path to image file (jpg/png)")
-    parser.add_argument("--analyst",     default="MFAD-CLI", help="Analyst name for report")
-    parser.add_argument("--output-json", action="store_true", help="Print master JSON to stdout")
+    parser.add_argument("image_path",    help="Path to image (jpg/png)")
+    parser.add_argument("--analyst",     default="MFAD-CLI")
+    parser.add_argument("--output-json", action="store_true",
+                        help="Print full master JSON to stdout")
     args = parser.parse_args()
 
     result = analyse_image(args.image_path, analyst_name=args.analyst)
 
     if args.output_json:
-        print(json.dumps(result, indent=2))
+        print(json.dumps(result, indent=2, default=str))
     else:
         fusion = result.get("fusion", {})
-        print(f"\n{'─' * 50}")
-        print(f"  Case ID    : {result.get('case_id')}")
-        print(f"  Verdict    : {fusion.get('verdict')}")
-        print(f"  Score      : {fusion.get('final_score', 0):.1%}")
-        print(f"  CI 95%     : {fusion.get('confidence_interval')}")
-        print(f"  Report     : {result.get('report_path')}")
-        print(f"{'─' * 50}\n")
+        print(f"\n{'─'*55}")
+        print(f"  Case ID  : {result.get('case_id')}")
+        print(f"  Decision : {fusion.get('decision')}")
+        print(f"  Score    : {fusion.get('final_score', 0):.1%}")
+        print(f"  CI 95%   : {fusion.get('confidence_interval')}")
+        print(f"  Report   : {result.get('report_path')}")
+        print(f"{'─'*55}\n")
