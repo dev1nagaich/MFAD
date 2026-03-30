@@ -30,8 +30,8 @@ import logging
 import sys
 from pathlib import Path
 
-from preprocessing_agent import PreprocessingAgent, run_preprocessing
-from metadata_agent       import MetadataAgent,       run_metadata
+from agents.preprocessing_agent import PreprocessingAgent, run_preprocessing
+from agents.metadata_agent       import MetadataAgent,       run_metadata
 
 logging.basicConfig(
     level=logging.INFO,
