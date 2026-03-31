@@ -1,0 +1,30 @@
+{
+  "image_path": "/home/rs_students/Documents/assignment/MFAD/test_images/suspect.jpg",
+  "face_bbox": [
+    0,
+    0,
+    224,
+    224
+  ],
+  "face_bboxes": [
+    [
+      0,
+      0,
+      224,
+      224
+    ]
+  ],
+  "face_count": 0,
+  "face_detected": false,
+  "image_dims": [
+    224,
+    224
+  ],
+  "hash_sha256": "8e701c2e1a118726f95ed6eb4b056f95aacc5652b00b9aa36812d7d9c7f95934",
+  "hash_md5": "a49db099a2b637a0c378e9689c745dc8",
+  "ela_score": 0.0,
+  "anomaly_score": 0.0,
+  "normalised_img_path": "outputs/preprocessing/suspect_normalised.jpg",
+  "exif_metadata": {},
+  "errors": []
+}

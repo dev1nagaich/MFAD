@@ -1,0 +1,56 @@
+{
+  "image_path": "/home/rs_students/Documents/assignment/MFAD/test_images/IMG_6930.JPG",
+  "face_bbox": [
+    359,
+    904,
+    1122,
+    1667
+  ],
+  "face_bboxes": [
+    [
+      359,
+      904,
+      1122,
+      1667
+    ],
+    [
+      855,
+      2071,
+      931,
+      2147
+    ]
+  ],
+  "face_count": 2,
+  "face_detected": true,
+  "image_dims": [
+    1242,
+    2208
+  ],
+  "hash_sha256": "7b3ce3d0c9b7976307bf4166d625a9dc28b12863963f0c9b1fc3551c19942e96",
+  "hash_md5": "30e2a06520eabf2bdf3341abc00a51a8",
+  "ela_score": 0.05044,
+  "anomaly_score": 0.05044,
+  "normalised_img_path": "outputs/preprocessing/IMG_6930_normalised.jpg",
+  "exif_metadata": {
+    "Orientation": 1,
+    "XResolution": [
+      72,
+      1
+    ],
+    "YResolution": [
+      72,
+      1
+    ],
+    "ResolutionUnit": 2,
+    "YCbCrPositioning": 1,
+    "ExifTag": 102,
+    "ExifVersion": "0221",
+    "ComponentsConfiguration": "\u0001\u0002\u0003",
+    "FlashpixVersion": "0100",
+    "ColorSpace": 1,
+    "PixelXDimension": 1242,
+    "PixelYDimension": 2208,
+    "SceneCaptureType": 0
+  },
+  "errors": []
+}

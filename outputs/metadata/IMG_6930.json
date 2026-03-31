@@ -1,0 +1,58 @@
+{
+  "image_path": "/home/rs_students/Documents/assignment/MFAD/test_images/IMG_6930.JPG",
+  "face_bbox": [
+    359,
+    904,
+    1122,
+    1667
+  ],
+  "face_bboxes": [
+    [
+      359,
+      904,
+      1122,
+      1667
+    ],
+    [
+      855,
+      2071,
+      931,
+      2147
+    ]
+  ],
+  "exif_camera_present": false,
+  "exif_camera_make": null,
+  "exif_camera_model": null,
+  "exif_datetime_original": null,
+  "exif_gps_present": false,
+  "software_tag": null,
+  "software_flagged": false,
+  "ela_chi2": 172767168.0,
+  "ela_map_path": "outputs/metadata/IMG_6930_ela_map.png",
+  "thumbnail_mismatch": false,
+  "prnu_score": 0.004897,
+  "prnu_absent": true,
+  "anomaly_score": 0.3,
+  "exif_raw": {
+    "Orientation": 1,
+    "XResolution": [
+      72,
+      1
+    ],
+    "YResolution": [
+      72,
+      1
+    ],
+    "ResolutionUnit": 2,
+    "YCbCrPositioning": 1,
+    "ExifTag": 102,
+    "ExifVersion": "0221",
+    "ComponentsConfiguration": "\u0001\u0002\u0003",
+    "FlashpixVersion": "0100",
+    "ColorSpace": 1,
+    "PixelXDimension": 1242,
+    "PixelYDimension": 2208,
+    "SceneCaptureType": 0
+  },
+  "errors": []
+}
