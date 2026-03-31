@@ -480,7 +480,7 @@ Template auto-flags rppg_snr < 0.45 and corneal_deviation_deg > 5°.
 
 ## agents/metadata_agent.py
 
-**Owner:** Sania / Aditi
+**Owner:** Aditi
 **Libraries:** `piexif`, `Pillow`, `numpy`
 **Note:** Runs on the original image (not the face crop).
 
