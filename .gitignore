@@ -1,9 +1,97 @@
-reports/
-test_images/
-temp/
-.vscode/
+# Virtual Environments
+myenv/
+mfadenv/
+venv/
+env/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Python
 __pycache__/
 report_agent/__pycache__/
 agents/__pycache__/
 fusion/__pycache__/
+preprocessing_metadata_agent/__pycache__/
+report_agent/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+
+# IDE & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb_checksum
+
+# Model Files (Large - download on demand)
+shape_predictor_68_face_landmarks.dat
+shape_predictor_68_face_landmarks.dat.bz2
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.onnx
+
+# Hugging Face Cache (models auto-download on first run)
+.cache/
+huggingface/
+hf_cache/
+
+# Project Outputs (generated - not source control)
 outputs/
+reports/
+results/
+temp/
+*.pdf
+
+# Test & Test Data
+test_images/
+test_outputs/
+.pytest_cache/
+.coverage
+htmlcov/
+tests/.pytest_cache/
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# OS Files
+Thumbs.db
+*.bak
+*.tmp
+
+# Environment & Config
+.env
+.env.local
+config.json.local
+config.*.json
+
+# Large Data Files
+*.zip
+*.tar.gz
+*.tar.bz2
+*.csv
+*.tsv
+
+# Package Manager
+package-lock.json
+yarn.lock
+pip-log.txt
+pip-delete-this-directory.txt

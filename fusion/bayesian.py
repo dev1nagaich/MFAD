@@ -255,8 +255,32 @@ def bayesian_fusion(
     """
     log.info("bayesian_fusion | modules received: %s", list(per_module_scores.keys()))
 
-    # ── 1. Clamp all scores ────────────────────────────────────────────────
-    clamped = {k: _clamp(v) for k, v in per_module_scores.items() if v is not None}
+    # ── 1. Filter and validate scores ──────────────────────────────────────
+    # Skip None, NaN, and out-of-range values
+    clamped = {}
+    skipped = []
+    
+    for module, score in per_module_scores.items():
+        # Skip None values
+        if score is None:
+            skipped.append(f"{module}=None")
+            continue
+        
+        # Skip NaN values
+        if isinstance(score, float) and math.isnan(score):
+            skipped.append(f"{module}=NaN")
+            continue
+        
+        # Skip invalid range (should be 0-1)
+        if not isinstance(score, (int, float)) or score < 0 or score > 1:
+            skipped.append(f"{module}=invalid({score})")
+            continue
+        
+        # Valid score — clamp and add
+        clamped[module] = _clamp(score)
+    
+    if skipped:
+        log.warning("bayesian_fusion | skipped modules: %s", ", ".join(skipped))
 
     # ── 2. Fuse ────────────────────────────────────────────────────────────
     final_score = round(_fuse_scores(clamped), 6)

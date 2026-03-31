@@ -843,6 +843,7 @@ Write ONLY the 3-sentence summary. No headers.
         "fusion":          fusion_result,
         "executive_summary": executive_summary,
         "errors":          state.get("errors", []),
+        "report_path":     None,  # Will be set below after PDF generation
     }
 
     # ── Generate PDF report ────────────────────────────────────────────────
@@ -854,12 +855,14 @@ Write ONLY the 3-sentence summary. No headers.
         report_output = rg.generate(ctx)
         report_path   = report_output["report_path"]
         master_output["report_output"] = report_output
+        master_output["report_path"] = report_path
         log.info("  ✓ PDF report generated → %s", report_path)
     except Exception as exc:
         log.warning("  PDF generation failed (%s) — saving JSON only", exc)
         os.makedirs("outputs", exist_ok=True)
         with open(report_path, "w") as f:
             json.dump(master_output, f, indent=2, default=str)
+        master_output["report_path"] = report_path
         log.info("  ✓ JSON fallback → %s", report_path)
 
     return {
