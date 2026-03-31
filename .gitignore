@@ -1,3 +1,9 @@
 reports/
 test_images/
 temp/
+.vscode/
+__pycache__/
+report_agent/__pycache__/
+agents/__pycache__/
+fusion/__pycache__/
+outputs/
