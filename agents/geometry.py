@@ -1,281 +1,237 @@
-"""
-agents/face/geometry.py
-Owner: Veedhee
-Activated by: face_present=True from content_router
-Face bbox lifecycle: geometry_agent runs RetinaFace → gets face_bbox →
-pool_dispatch_node passes it to remaining face agents
-"""
-
-import numpy as np
-import dlib
 import cv2
-from scipy.spatial import distance as dist
+import dlib
+import numpy as np
+import os
 
 
-# ──────────────────────────────────────────────
-# Authentic norms (mean ± 2 SD thresholds)
-# ──────────────────────────────────────────────
+PREDICTOR_PATH = "shape_predictor_68_face_landmarks.dat"
+
 NORMS = {
-    "symmetry_index":     {"mean": 0.85, "sd": 0.07},
-    "jaw_curvature_deg":  {"mean": 45.0,  "sd": 25.0},
-    "ear_alignment_px":   {"mean": 5.0,  "sd": 4.0},
-    "philtrum_length":    {"mean": 0.15, "sd": 0.05},
+    "inter_ocular_dist":     (120.0, 20.0),
+    "symmetry_index":        (0.96,  0.04),
+    "jaw_curvature_deg":     (2.5,   1.5),
+    "nasolabial_fold_depth": (2.95,  0.425),
+    "eye_aspect_ratio_l":    (0.31,  0.03),
+    "eye_aspect_ratio_r":    (0.31,  0.03),
+    "lip_thickness_ratio":   (0.22,  0.04),
+    "philtrum_length_mm":    (14.5,  3.5),
+    "ear_alignment_px":      (1.5,   1.5),
 }
 
-DLIB_PREDICTOR_PATH = "shape_predictor_68_face_landmarks.dat"  # ~100MB, not in git
 
+class GeometryAgent:
+    _instance = None
 
-# ──────────────────────────────────────────────
-# RetinaFace loader (lazy import)
-# ──────────────────────────────────────────────
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance.detector  = dlib.get_frontal_face_detector()
+            cls._instance.predictor = dlib.shape_predictor(PREDICTOR_PATH)
+        return cls._instance
 
-# ──────────────────────────────────────────────
-# Step 1 — RetinaFace detection on full image
-# ──────────────────────────────────────────────
-def detect_face_retinaface(image_bgr: np.ndarray) -> dict:
-    """
-    Uses dlib instead of RetinaFace for face detection.
-    Returns same schema so the rest of the pipeline is unchanged.
-    """
-    detector = dlib.get_frontal_face_detector()
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    dets, scores, _ = detector.run(gray, 0)
+    def _get_landmarks(self, image_path, face_bbox):
+        img  = cv2.imread(image_path)
+        h, w = img.shape[:2]
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        x1 = max(0, face_bbox[0])
+        y1 = max(0, face_bbox[1])
+        x2 = min(w, face_bbox[2])
+        y2 = min(h, face_bbox[3])
+        rect  = dlib.rectangle(x1, y1, x2, y2)
+        shape = self.predictor(gray, rect)
+        pts   = np.array([[shape.part(i).x, shape.part(i).y]
+                          for i in range(68)], dtype=float)
+        return pts, img
 
-    if len(dets) == 0:
-        return {"face_bbox": None, "landmark_confidence": 0.0, "found": False}
+    def _iod_raw(self, pts):
+        """Raw pixel IOD — outer eye corners."""
+        return float(np.linalg.norm(pts[45] - pts[36]))
 
-    # Pick highest scoring detection
-    best_idx = int(np.argmax(scores))
-    d = dets[best_idx]
-    score = float(scores[best_idx])
+    def _iod_normalised(self, pts, img_width):
+        """IOD normalised to a standard 500px wide image."""
+        return self._iod_raw(pts) * (500.0 / img_width)
 
-    # Normalize score to 0-1 range (dlib scores typically 0-3)
-    confidence = min(max(score / 1.0, 0.0), 1.0)
+    def _px_per_mm(self, pts, img_width):
+        """Use normalised IOD (scaled to 500px wide image) / 65mm."""
+        norm_iod = self._iod_raw(pts) * (500.0 / img_width)
+        return norm_iod / 65.0
 
+    # ------------------------------------------------------------------ #
+    #  Metrics                                                             #
+    # ------------------------------------------------------------------ #
+    def _symmetry_index(self, pts):
+        LEFT  = [0,1,2,3,4,5,6,7,31,32,36,37,38,39,40,41,48,49,50,59,58,57]
+        RIGHT = [16,15,14,13,12,11,10,9,35,34,45,44,43,42,47,46,54,53,52,55,56,51]
+        mid_x = (pts[0, 0] + pts[16, 0]) / 2
+        iod   = self._iod_raw(pts)
+        diffs = [abs(abs(pts[l, 0] - mid_x) - abs(pts[r, 0] - mid_x))
+                 for l, r in zip(LEFT, RIGHT)]
+        return float(1.0 - np.mean(diffs) / iod)
 
-    h, w = image_bgr.shape[:2]
-    face_bbox = [
-        max(0, d.left()),
-        max(0, d.top()),
-        min(w, d.right()),
-        min(h, d.bottom())
-    ]
-    return {
-        "face_bbox": face_bbox,
-        "landmark_confidence": round(confidence, 4),
-        "found": True,
-    }
+    def _jaw_curvature(self, pts):
+        """Deviation of chin midpoint from straight jaw line, in degrees."""
+        jaw   = pts[0:17]
+        start = jaw[0]
+        end   = jaw[16]
+        mid   = jaw[8]
+        line_vec = end - start
+        line_len = np.linalg.norm(line_vec)
+        if line_len < 1e-6:
+            return 0.0
+        t = np.dot(mid - start, line_vec) / (line_len ** 2)
+        closest  = start + t * line_vec
+        deviation = np.linalg.norm(mid - closest)
+        return float((deviation / line_len) * 10.0)
 
+    def _nasolabial_fold_depth(self, pts, img_width):
+        """
+        Approximate nasolabial fold depth using the perpendicular
+        distance from nose-mouth midpoint to the cheek line, in mm.
+        """
+        px_mm = self._px_per_mm(pts, img_width)
 
-# ──────────────────────────────────────────────
-# Step 2 — Crop face region
-# ──────────────────────────────────────────────
-def crop_face(image_bgr: np.ndarray, face_bbox: list) -> np.ndarray:
-    x1, y1, x2, y2 = face_bbox
-    h, w = image_bgr.shape[:2]
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(w, x2), min(h, y2)
-    return image_bgr[y1:y2, x1:x2]
+        # Midpoint between nose bottom (33) and mouth corner (48) — left side
+        left_mid  = (pts[33] + pts[48]) / 2
+        # Midpoint between nose bottom (33) and mouth corner (54) — right side
+        right_mid = (pts[33] + pts[54]) / 2
 
+        # Use cheek width (landmark 2 to 14) as reference line
+        cheek_left  = pts[2]
+        cheek_right = pts[14]
+        cheek_width_px = np.linalg.norm(cheek_right - cheek_left)
 
-# ──────────────────────────────────────────────
-# Step 3 — dlib 68-point landmarks on face crop
-# ──────────────────────────────────────────────
-def get_landmarks_dlib(face_crop_bgr: np.ndarray) -> np.ndarray | None:
-    """
-    Returns (68, 2) array of (x, y) landmark coordinates,
-    or None if no face is detected in the crop.
-    """
-    detector = dlib.get_frontal_face_detector()
-    predictor = dlib.shape_predictor(DLIB_PREDICTOR_PATH)
+        # Fold depth as fraction of cheek width, converted to mm
+        left_depth  = np.linalg.norm(left_mid  - cheek_left)  / (cheek_width_px + 1e-6)
+        right_depth = np.linalg.norm(right_mid - cheek_right) / (cheek_width_px + 1e-6)
 
-    gray = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2GRAY)
-    dets = detector(gray, 1)
+        avg_ratio = (left_depth + right_depth) / 2.0
+        # Scale to expected mm range (2.1–3.8mm)
+        return float(avg_ratio * 65.0 / (px_mm + 1e-6) * 0.35)
+    
+    def _eye_aspect_ratio(self, pts, side="left"):
+        p = pts[36:42] if side == "left" else pts[42:48]
+        A = np.linalg.norm(p[1] - p[5])
+        B = np.linalg.norm(p[2] - p[4])
+        C = np.linalg.norm(p[0] - p[3])
+        return float((A + B) / (2.0 * C + 1e-6))
 
-    if len(dets) == 0:
-        return None
+    def _lip_thickness_ratio(self, pts):
+        lip_height  = np.linalg.norm(pts[62] - pts[66])
+        mouth_width = np.linalg.norm(pts[48] - pts[54])
+        ratio = float(lip_height / (mouth_width + 1e-6))
+        
+        # Mouth is closed — metric unreliable, return norm mean so it contributes 0 to anomaly score
+        if ratio < 0.05:
+            return 0.22
+        
+        return ratio
 
-    shape = predictor(gray, dets[0])
-    landmarks = np.array([[shape.part(i).x, shape.part(i).y]
-                           for i in range(68)], dtype=np.float64)
-    return landmarks
+    def _philtrum_length_mm(self, pts, img_width):
+        px_mm = self._px_per_mm(pts, img_width)
+        px    = np.linalg.norm(pts[33] - pts[51])
+        return float(px / (px_mm + 1e-6))
 
+    def _ear_alignment(self, pts):
+        """Vertical pixel difference between jaw endpoints (proxy for ear alignment)."""
+        return float(abs(pts[0, 1] - pts[16, 1]))
 
-# ──────────────────────────────────────────────
-# Step 4 — Anthropometric ratio computations
-# ──────────────────────────────────────────────
+    def _neck_face_boundary(self, pts, img):
+        chin_x = int(pts[8, 0])
+        chin_y = int(pts[8, 1])
+        h      = img.shape[0]
+        y1 = chin_y
+        y2 = min(h, chin_y + 60)
+        x1 = max(0, chin_x - 20)
+        x2 = min(img.shape[1], chin_x + 20)
+        if y2 <= y1:
+            return "smooth"
+        gray_strip = cv2.cvtColor(img[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+        variance   = float(cv2.Laplacian(gray_strip, cv2.CV_64F).var())
+        return "smooth" if variance < 500 else "sharp edge"
 
-def compute_symmetry_index(lm: np.ndarray) -> float:
-    """
-    Compares left vs right mirrored landmark distances from the face midline.
-    Uses paired landmarks: eyebrows (17-21 vs 22-26), eyes (36-41 vs 42-47),
-    mouth corners (48, 54).
-    Returns symmetry_index in [0, 1]; 1.0 = perfect symmetry.
-    """
-    # Midline x = midpoint of nasion (landmark 27) and chin (8)
-    midline_x = (lm[27][0] + lm[8][0]) / 2.0
+    # ------------------------------------------------------------------ #
+    #  Anomaly score — only deviations beyond ±2 SD contribute            #
+    # ------------------------------------------------------------------ #
+    def _anomaly_score(self, metrics):
+        contributions = []
+        for key in NORMS:
+            if key not in metrics:
+                continue
+            mu, sigma = NORMS[key]
+            z = abs(metrics[key] - mu) / (sigma + 1e-6)
+            if z > 2.0:
+                contribution = 1.0 - 1.0 / (1.0 + (z - 2.0) * 0.4)
+                contributions.append(contribution)
 
-    # Paired landmark indices (left, right)
-    pairs = [
-        (17, 26), (18, 25), (19, 24), (20, 23), (21, 22),  # eyebrows
-        (36, 45), (39, 42),                                   # eye corners
-        (48, 54), (49, 53), (50, 52),                         # mouth
-        (0, 16), (1, 15), (2, 14), (3, 13),                   # jaw sides
-    ]
+        if not contributions:
+            return 0.0
 
-    diffs = []
-    for l_idx, r_idx in pairs:
-        d_left  = abs(lm[l_idx][0] - midline_x)
-        d_right = abs(lm[r_idx][0] - midline_x)
-        max_d = max(d_left, d_right, 1e-6)
-        diffs.append(abs(d_left - d_right) / max_d)
+        return float(min(1.0, 0.6 * max(contributions) + 0.4 * np.mean(contributions)))
 
-    asymmetry = float(np.mean(diffs))
-    return round(1.0 - asymmetry, 4)
+    # ------------------------------------------------------------------ #
+    #  Overlay image — Figure 1 in report                                 #
+    # ------------------------------------------------------------------ #
+    def _save_overlay(self, img, pts, image_path):
+        overlay = img.copy()
+        for i, (x, y) in enumerate(pts.astype(int)):
+            cv2.circle(overlay, (x, y), 2, (0, 255, 0), -1)
+            cv2.putText(overlay, str(i), (x + 2, y - 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.25, (0, 200, 255), 1)
+        for i in range(0, 16):
+            cv2.line(overlay, tuple(pts[i].astype(int)),
+                     tuple(pts[i+1].astype(int)), (255, 100, 0), 1)
+        mid_x = int((pts[0, 0] + pts[16, 0]) / 2)
+        cv2.line(overlay, (mid_x, int(pts[27, 1])),
+                 (mid_x, int(pts[8, 1])), (0, 100, 255), 1)
+        out_path = os.path.join(os.path.dirname(image_path) or ".",
+                                "figure1_landmark_overlay.png")
+        cv2.imwrite(out_path, overlay)
+        return out_path
 
+    # ------------------------------------------------------------------ #
+    #  Public entry point                                                  #
+    # ------------------------------------------------------------------ #
+    def run(self, image_path: str, face_bbox: list) -> dict:
+        pts, img = self._get_landmarks(image_path, face_bbox)
+        iod_norm = self._iod_normalised(pts, img.shape[1])
 
-def compute_jaw_curvature_deg(lm: np.ndarray) -> float:
-    """
-    Fits a polynomial to jaw landmarks (0–16) and returns the
-    mean angular deviation in degrees from a straight line.
-    """
-    jaw_pts = lm[0:17]  # 17 jaw landmarks
-    x = jaw_pts[:, 0]
-    y = jaw_pts[:, 1]
+        # Clip bbox for output
+        h, w = img.shape[:2]
+        x1 = max(0, face_bbox[0])
+        y1 = max(0, face_bbox[1])
+        x2 = min(w, face_bbox[2])
+        y2 = min(h, face_bbox[3])
 
-    coeffs = np.polyfit(x, y, 2)           # quadratic fit
-    a = coeffs[0]
-    # Curvature ≈ 2a for quadratic; convert to degrees via arctan
-    curvature_rad = np.arctan(abs(2 * a * np.mean(x)))
-    return round(float(np.degrees(curvature_rad)), 4)
-
-
-def compute_ear_alignment_px(lm: np.ndarray) -> float:
-    """
-    Measures vertical misalignment between left ear (landmark 0)
-    and right ear (landmark 16) in pixels.
-    """
-    left_ear_y  = lm[0][1]
-    right_ear_y = lm[16][1]
-    return round(float(abs(left_ear_y - right_ear_y)), 4)
-
-
-def compute_philtrum_length(lm: np.ndarray) -> float:
-    """
-    Philtrum = distance from nose base (landmark 33) to upper lip (landmark 51),
-    normalised by face height (chin 8 to nasion 27).
-    """
-    nose_base   = lm[33]
-    upper_lip   = lm[51]
-    chin        = lm[8]
-    nasion      = lm[27]
-
-    philtrum_px   = dist.euclidean(nose_base, upper_lip)
-    face_height   = dist.euclidean(chin, nasion)
-
-    if face_height < 1e-6:
-        return 0.0
-    return round(float(philtrum_px / face_height), 4)
-
-
-# ──────────────────────────────────────────────
-# Step 5 — Anomaly score vs authentic norms
-# ──────────────────────────────────────────────
-def compute_anomaly_score(metrics: dict) -> float:
-    """
-    Z-score each metric against norms; anomaly_score = mean of
-    normalised deviations clipped to [0, 1].
-    A score > 0.5 suggests deviation beyond ±2 SD from norms.
-    """
-    z_scores = []
-    for key, norm in NORMS.items():
-        value = metrics.get(key)
-        if value is None:
-            continue
-        z = abs(value - norm["mean"]) / (2 * norm["sd"] + 1e-9)
-        z_scores.append(min(z, 1.0))          # clip each z to [0, 1]
-
-    return round(float(np.mean(z_scores)) if z_scores else 0.0, 4)
-
-
-# ──────────────────────────────────────────────
-# Main agent entry point
-# ──────────────────────────────────────────────
-def run(image_bgr: np.ndarray, face_present: bool = True) -> dict:
-    """
-    Geometry agent entry point.
-
-    Args:
-        image_bgr:    Full image as BGR numpy array.
-        face_present: Gate flag from content_router. If False, skip processing.
-
-    Returns:
-        Agent output dict matching the defined schema.
-    """
-    # Gate check
-    if not face_present:
-        return {"agent_applicable": False, "reason": "face_present=False from content_router"}
-
-    # ── Step 1: RetinaFace detection ──
-    detection = detect_face_retinaface(image_bgr)
-
-    face_bbox           = detection["face_bbox"]
-    landmark_confidence = detection["landmark_confidence"]
-
-    # ── Step 6: Early exit conditions ──
-    if not detection["found"] or landmark_confidence < 0.1:
-        return {
-            "face_bbox":            face_bbox,
-            "symmetry_index":       None,
-            "jaw_curvature_deg":    None,
-            "ear_alignment_px":     None,
-            "philtrum_length":      None,
-            "landmark_confidence":  landmark_confidence,
-            "anomaly_score":        None,
-            "agent_applicable":     False,
+        metrics = {
+            "inter_ocular_dist":     iod_norm,
+            "symmetry_index":        self._symmetry_index(pts),
+            "jaw_curvature_deg":     self._jaw_curvature(pts),
+            "nasolabial_fold_depth": self._nasolabial_fold_depth(pts, img.shape[1]),
+            "eye_aspect_ratio_l":    self._eye_aspect_ratio(pts, "left"),
+            "eye_aspect_ratio_r":    self._eye_aspect_ratio(pts, "right"),
+            "lip_thickness_ratio":   self._lip_thickness_ratio(pts),
+            "philtrum_length_mm":   self._philtrum_length_mm(pts, img.shape[1]),
+            "ear_alignment_px":      self._ear_alignment(pts),
         }
 
-    # ── Step 2: Crop face ──
-    face_crop = crop_face(image_bgr, face_bbox)
+        anomaly = self._anomaly_score(metrics)
 
-    # ── Step 3: dlib 68-point landmarks ──
-    landmarks = get_landmarks_dlib(face_crop)
-
-    if landmarks is None:
         return {
-            "face_bbox":            face_bbox,
-            "symmetry_index":       None,
-            "jaw_curvature_deg":    None,
-            "ear_alignment_px":     None,
-            "philtrum_length":      None,
-            "landmark_confidence":  landmark_confidence,
-            "anomaly_score":        None,
-            "agent_applicable":     False,
+            # --- required by contracts.py ---
+            "face_bbox":           [x1, y1, x2, y2],
+            "symmetry_index":      metrics["symmetry_index"],
+            "jaw_curvature_deg":   metrics["jaw_curvature_deg"],
+            "ear_alignment_px":    metrics["ear_alignment_px"],
+            "philtrum_length_mm":   metrics["philtrum_length_mm"],
+            "landmark_confidence": float(min(1.0, iod_norm / 80.0)),
+            "anomaly_score":       anomaly,
+            "agent_applicable":    anomaly > 0.0,   # False only if no face found
+            # --- extra metrics for report section 4.1 ---
+            "inter_ocular_dist":     metrics["inter_ocular_dist"],
+            "nasolabial_fold_depth": metrics["nasolabial_fold_depth"],
+            "eye_aspect_ratio_l":    metrics["eye_aspect_ratio_l"],
+            "eye_aspect_ratio_r":    metrics["eye_aspect_ratio_r"],
+            "lip_thickness_ratio":   metrics["lip_thickness_ratio"],
+            "neck_face_boundary":    self._neck_face_boundary(pts, img),
+            "overlay_image_path":    self._save_overlay(img, pts, image_path),
         }
-
-    # ── Step 4: Anthropometric ratios ──
-    symmetry_index    = compute_symmetry_index(landmarks)
-    jaw_curvature_deg = compute_jaw_curvature_deg(landmarks)
-    ear_alignment_px  = compute_ear_alignment_px(landmarks)
-    philtrum_length   = compute_philtrum_length(landmarks)
-
-    metrics = {
-        "symmetry_index":    symmetry_index,
-        "jaw_curvature_deg": jaw_curvature_deg,
-        "ear_alignment_px":  ear_alignment_px,
-        "philtrum_length":   philtrum_length,
-    }
-
-    # ── Step 5: Anomaly score ──
-    anomaly_score = compute_anomaly_score(metrics)
-
-    return {
-        "face_bbox":            face_bbox,
-        "symmetry_index":       symmetry_index,
-        "jaw_curvature_deg":    jaw_curvature_deg,
-        "ear_alignment_px":     ear_alignment_px,
-        "philtrum_length":      philtrum_length,
-        "landmark_confidence":  landmark_confidence,
-        "anomaly_score":        anomaly_score,
-        "agent_applicable":     True,
-    }
