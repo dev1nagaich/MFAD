@@ -87,10 +87,10 @@ TEXTURE_KEYS = [
 # Maps to: §5.5 Biological Plausibility Assessment
 # ─────────────────────────────────────────────────────────────────────────────
 BIOLOGICAL_KEYS = [
-    "rppg_snr",              # float — rPPG signal-to-noise ratio        (authentic: >0.45)
-    "corneal_deviation_deg", # float — corneal highlight angular deviation L vs R eye (authentic: <5 deg)
-    "micro_texture_var",     # float — perioral micro-texture variance    (authentic mean: ~0.031)
-    "vascular_pearson_r",    # float — subcutaneous vascular Pearson r   (authentic: >0.88)
+    "pupil_biou",            # float — pupil-shape Boundary IoU (ellipse fit vs mask)      (authentic: >0.55)
+    "corneal_reflex_iou",    # float — IoU between L/R corneal reflection masks           (authentic: >0.15)
+    "pupil_solidity",        # float — pupil-contour solidity (area/hull_area)             (authentic: >0.90)
+    "reflection_count",      # int   — total corneal reflection pixels detected (L+R eyes)
     "anomaly_score",         # float — [0,1] biological plausibility probability (§6 weight: 0.15)
 ]
 
@@ -244,11 +244,11 @@ AUTHENTIC_BASELINES = {
     "emd_max":                       0.08,
     "seam_emd_threshold":            0.15,
     "lbp_uniformity_min":            0.85,
-    # §5.5 Biological
-    "rppg_snr_min":                  0.45,
-    "corneal_deviation_deg_max":     5.0,
-    "micro_texture_var_mean":        0.031,
-    "vascular_pearson_r_min":        0.88,
+    # §5.5 Biological (single-image pupil/cornea geometry — not physiological)
+    "pupil_biou_min":                0.55,
+    "corneal_reflex_iou_min":        0.15,
+    "pupil_solidity_min":            0.90,
+    "reflection_count_min":          4,
     # §7 Reference comparison
     "cosine_dist_same_person_max":   0.40,
 }

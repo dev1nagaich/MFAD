@@ -243,21 +243,17 @@ def biological_tool(image_path: str, face_bbox: list) -> dict:
     finally:
         face_mesh.close()
 
-    # Map biological_plausibility_agent output → contracts.py BIOLOGICAL_KEYS
-    # rppg_snr      : avg_biou used as proxy (real rPPG needs video; single-image
-    #                 BIoU is the closest available signal from this agent)
-    # corneal_deviation_deg: derived from iou_reflect (lower IoU = more deviation)
-    # micro_texture_var    : derived from solidity (lower solidity = over-smoothed)
-    # vascular_pearson_r   : not available from this agent — set to None
+    # Map biological_plausibility_agent output → contracts.py BIOLOGICAL_KEYS.
+    # Single-image pipeline: we measure pupil shape + corneal reflection geometry
+    # directly. rPPG / vascular Pearson would require video and are not emitted.
 
     avg_biou   = float(raw.get("avg_biou", 0.5))
     iou_ref    = float(raw.get("iou_reflect", 0.0))
     solidity   = float(raw.get("solidity", 1.0))
+    refl_count = int(raw.get("reflection_count", 0))
     prediction = raw.get("prediction", "real")
 
     # anomaly_score: fake → high score, real → low score
-    # Use inverse of avg_biou as primary signal (low BIoU = irregular pupil = fake)
-    # Blend with corneal IoU signal
     raw_score  = 0.6 * (1.0 - avg_biou) + 0.4 * max(0.0, 1.0 - iou_ref * 2)
     anomaly_score = float(min(1.0, max(0.0, raw_score)))
 
@@ -271,14 +267,13 @@ def biological_tool(image_path: str, face_bbox: list) -> dict:
         "convexity":             float(raw.get("convexity", 1.0)),
         "aspect":                float(raw.get("aspect", 1.0)),
         "hu1":                   float(raw.get("hu1", 0.0)),
-        "reflection_count":      int(raw.get("reflection_count", 0)),
         "landmarks_found":       bool(raw.get("landmarks_found", False)),
         "prediction":            prediction,
-        # contracts.py BIOLOGICAL_KEYS mapped values
-        "rppg_snr":              round(avg_biou, 4),           # proxy
-        "corneal_deviation_deg": round((1.0 - iou_ref) * 20, 4),  # scaled proxy
-        "micro_texture_var":     round(solidity * 0.031, 4),   # scaled proxy
-        "vascular_pearson_r":    None,                         # not available
+        # contracts.py BIOLOGICAL_KEYS — honest field names (no fake proxies)
+        "pupil_biou":            round(avg_biou, 4),
+        "corneal_reflex_iou":    round(iou_ref, 4),
+        "pupil_solidity":        round(solidity, 4),
+        "reflection_count":      refl_count,
         "anomaly_score":         round(anomaly_score, 4),
     }
 

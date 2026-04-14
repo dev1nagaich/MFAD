@@ -98,3 +98,14 @@ package-lock.json
 yarn.lock
 pip-log.txt
 pip-delete-this-directory.txt
+# Added by code-review-graph
+.code-review-graph/
+.claude/
+.kiro/
+.cursorrules
+.mcp.json
+.opencode.json
+.windsurfrules
+AGENTS.md
+CLAUDE.md
+GEMINI.md
