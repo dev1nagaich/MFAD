@@ -36,6 +36,7 @@ FIRST RUN WARNING:
 """
 
 import sys
+import re
 import time
 import logging
 from pathlib import Path
@@ -77,11 +78,26 @@ BLUE_THRESHOLD = 0.5    # above this  → BLUE zone  (medium_activation_regions)
 # Do not change this format — it is specific to LLaVA-1.5.
 FORENSIC_PROMPT = (
     "USER: <image>\n"
-    "Is this a face or not if yes?,"
-    "Look carefully at: skin texture, eye reflections, jaw edges, "
-    "and the boundary between the face and neck. "
-    "First state REAL or FAKE, then describe the specific suspicious "
-    "features you can see.\nASSISTANT:"
+    "You are a forensic image analyst. Examine this face image carefully and "
+    "determine whether it is a genuine photograph or a synthetically generated "
+    "or manipulated image.\n"
+    "Examine each of the following features and describe exactly what you observe:\n"
+    "1. Skin texture — are pores, fine lines, and surface detail natural or unnaturally smooth?\n"
+    "2. Eye reflections — are the corneal highlights in both eyes geometrically consistent?\n"
+    "3. Jaw and neck boundary — is the transition between face and neck natural or does it show blending artefacts?\n"
+    "4. Ear detail — are both ears present, symmetric, and naturally detailed?\n"
+    "5. Hair boundary — does the hair blend naturally into the face or show unnatural merging?\n"
+    "Based only on what you observe above, state your conclusion.\n"
+    "Respond in exactly this format:\n"
+    "FAKE\n"
+    "or\n"
+    "REAL\n"
+    "Feature 1: [what you actually observed]\n"
+    "Feature 2: [what you actually observed]\n"
+    "Feature 3: [what you actually observed]\n"
+    "Feature 4: [what you actually observed]\n"
+    "Feature 5: [what you actually observed]\n"
+    "ASSISTANT:"
 )
 
 # Nine named face regions for zone classification.
@@ -112,8 +128,6 @@ TEMP_DIR.mkdir(exist_ok=True)
 # ─────────────────────────────────────────────────────────────────────────────
 _llava_processor = None
 _llava_model     = None
-
-
 def _load_llava() -> tuple:
     """
     Load LLaVA-1.5-7b from HuggingFace. Cache it after the first load.
@@ -144,57 +158,46 @@ def _load_llava() -> tuple:
 
     return _llava_processor, _llava_model
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # PATH A: LLaVA FORENSIC INFERENCE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run_llava(image_path: str) -> tuple:
     """
-    Run LLaVA-1.5-7b on the original full image with the forensic prompt.
-
-    Returns:
-        caption    (str)   — LLaVA's full natural language response
-        verdict    (str)   — "REAL" | "FAKE" | "UNCERTAIN"
-        confidence (float) — [0,1] score derived from the language content
+    Run LLaVA-1.5-7b on the full image with the forensic prompt.
+    Runs on full image per §5.4 — all three zones (RED/BLUE/VIOLET)
+    require the complete scene including background and shoulders.
     """
     processor, model = _load_llava()
 
-    # Open the image as RGB (LLaVA needs PIL RGB input)
     image = Image.open(image_path).convert("RGB")
 
-    # Processor converts image + text into PyTorch tensors the model can read
     inputs = processor(
         text=FORENSIC_PROMPT,
         images=image,
         return_tensors="pt",
     )
 
-    # Move tensors to the same device as the model's first layer.
-    # With device_map="auto", layers may be on GPU0, GPU1, or CPU — we
-    # cannot hardcode "cuda:0". next(model.parameters()).device is always correct.
     device = next(model.parameters()).device
     inputs = {
         k: v.to(device) if hasattr(v, "to") else v
         for k, v in inputs.items()
     }
 
-    # Generate the response.
-    # torch.no_grad() disables gradient tracking — only needed during training.
-    # Disabling it saves memory and speeds up inference.
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=300,   # enough for a detailed forensic paragraph
-            do_sample=False,      # greedy = deterministic, same image → same answer
+            max_new_tokens=300,
+            min_new_tokens=40,        # force explanation, not just one word
+            do_sample=True,           # avoid greedy one-token collapse
+            temperature=0.2,          # low = mostly deterministic, not random
+            repetition_penalty=1.15,  # discourages early stopping
         )
 
-    # Decode token IDs back to English text
     full_text = processor.batch_decode(
         output_ids, skip_special_tokens=True
     )[0].strip()
 
-    # LLaVA includes the full prompt in the output — extract only the answer
     caption = (
         full_text.split("ASSISTANT:")[-1].strip()
         if "ASSISTANT:" in full_text
@@ -208,52 +211,55 @@ def _run_llava(image_path: str) -> tuple:
 
 
 def _parse_verdict(caption: str) -> tuple:
-    """
-    Convert LLaVA's English paragraph into a structured verdict + confidence.
-
-    Logic:
-      1. Scan for explicit verdict words: "fake", "real", "authentic" etc.
-      2. Count all supporting keywords on each side.
-      3. Confidence = 0.60 base + 0.05 per extra keyword, capped at 0.98.
-      4. Return UNCERTAIN when neither side is clearly dominant.
-
-    We never return confidence=1.0 from text parsing alone — language
-    is inherently ambiguous and should not claim absolute certainty.
-    """
     text = caption.lower()
+    lines = text.split("\n")
+    first_line = lines[0].strip()
+    explanation = " ".join(lines[1:]).strip()  # everything after the verdict line
 
+    # First-line verdict check — but now score the explanation too
+    if first_line.startswith("fake"):
+        # Count fake-signal words in the explanation to scale confidence
+        fake_evidence = sum(1 for kw in [
+            r"\bfake\b", r"\bdeepfake\b", r"\bsynthetic\b", r"\bmanipulated\b",
+            r"\bsuspicious\b", r"\bunnatural\b", r"\banomalous\b",
+            r"\bartefact\b", r"\bartifact\b", r"\bblending\b",
+            r"\bcomposite\b", r"\bunrealistic\b", r"\bdistorted\b",
+            r"\bover.smooth", r"\bgan\b", r"\bai.generated\b",
+        ] if re.search(kw, explanation))
+        # Base 0.70 + 0.03 per corroborating word, capped at 0.97
+        confidence = round(min(0.70 + fake_evidence * 0.03, 0.97), 3)
+        return "FAKE", confidence
+
+    if first_line.startswith("real"):
+        real_evidence = sum(1 for kw in [
+            r"\bgenuine\b", r"\bauthentic\b", r"\bno signs\b",
+            r"\bno anomal", r"\bno suspicious", r"\bappears real\b",
+            r"\bconsistent\b", r"\bnatural\b",
+        ] if re.search(kw, explanation))
+        confidence = round(min(0.70 + real_evidence * 0.03, 0.97), 3)
+        return "REAL", confidence
+
+    # Fallback keyword scan on full text when first line is not a clean verdict
     fake_keywords = [
-        "fake", "ai-generated", "artificial", "generated", "deepfake",
-        "synthetic", "manipulated", "suspicious", "inconsistent",
-        "unnatural", "anomalous", "artefact", "artifact",
-        "blending", "composite", "unrealistic", "distorted",
+        r"\bfake\b", r"\bai.generated\b", r"\bdeepfake\b",
+        r"\bsynthetic\b", r"\bmanipulated\b", r"\bsuspicious\b",
+        r"\bunnatural\b", r"\banomalous\b", r"\bartefact\b", r"\bartifact\b",
+        r"\bblending\b", r"\bcomposite\b", r"\bunrealistic\b", r"\bdistorted\b",
+        r"\bover.smooth", r"\bgan\b",
     ]
     real_keywords = [
-        "real", "authentic", "genuine", "natural", "photograph",
-        "normal", "consistent", "no anomal", "no suspicious",
+        r"\bgenuine\b", r"\bauthentic\b", r"\bno signs of manipulation\b",
+        r"\bno anomal", r"\bno suspicious", r"\bappears real\b",
     ]
 
-    fake_count = sum(1 for kw in fake_keywords if kw in text)
-    real_count = sum(1 for kw in real_keywords if kw in text)
+    fake_count = sum(1 for kw in fake_keywords if re.search(kw, text))
+    real_count = sum(1 for kw in real_keywords if re.search(kw, text))
 
-    explicit_fake = any(kw in text for kw in ["fake", "ai-generated", "deepfake"])
-    explicit_real = any(kw in text for kw in ["real", "authentic", "genuine"])
-
-    if explicit_fake and not explicit_real:
-        return "FAKE", round(min(0.60 + fake_count * 0.05, 0.98), 3)
-
-    if explicit_real and not explicit_fake:
-        return "REAL", round(min(0.60 + real_count * 0.05, 0.98), 3)
-
-    if fake_count > real_count + 1:
-        return "FAKE", round(min(0.50 + (fake_count - real_count) * 0.04, 0.85), 3)
-
-    if real_count > fake_count + 1:
-        return "REAL", round(min(0.50 + (real_count - fake_count) * 0.04, 0.85), 3)
-
+    if fake_count > real_count:
+        return "FAKE", round(min(0.55 + fake_count * 0.05, 0.90), 3)
+    if real_count > fake_count:
+        return "REAL", round(min(0.55 + real_count * 0.05, 0.90), 3)
     return "UNCERTAIN", 0.50
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # PATH B: GRAD-CAM PLACEHOLDER
 # TEAMMATE MERGE POINT
@@ -268,7 +274,6 @@ def _parse_verdict(caption: str) -> tuple:
 # The rest of the file — zone classification, heatmap save, anomaly score —
 # needs NO changes. Only this function gets replaced.
 # ─────────────────────────────────────────────────────────────────────────────
-
 def _run_gradcam_placeholder(face_crop_path: str) -> tuple:
     """
     Placeholder for Grad-CAM. Returns neutral values.
@@ -278,13 +283,8 @@ def _run_gradcam_placeholder(face_crop_path: str) -> tuple:
     LLaVA at 30% and gan_probability at 50% (neutral 0.5 = 0.25 contribution).
     LLaVA still provides meaningful signal via the remaining 30%.
     """
-    logger.info(
-        "[VLMAgent] Grad-CAM placeholder active. "
-        "Awaiting EfficientNet-B4 from Agent 3 teammate."
-    )
     neutral = np.full((224, 224), 0.5, dtype=np.float32)
-    return neutral, 0.5, 0.5
-
+    return neutral, 0.5, 0.5, True   # ← add is_placeholder=True
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ZONE CLASSIFICATION
@@ -381,10 +381,9 @@ def _save_heatmap(cam_map: np.ndarray, face_crop_path: str, image_path: str) -> 
 # ─────────────────────────────────────────────────────────────────────────────
 # ANOMALY SCORE
 # ─────────────────────────────────────────────────────────────────────────────
-
 def _compute_anomaly_score(
-    vlm_verdict: str, vlm_confidence: float,
-    saliency_score: float, gan_probability: float, high_regions: list,
+    vlm_verdict, vlm_confidence, saliency_score, 
+    gan_probability, high_regions, gradcam_is_placeholder=False
 ) -> float:
     """
     Weighted combination of all VLM signals into a single [0,1] score.
@@ -408,14 +407,21 @@ def _compute_anomaly_score(
 
     high_ratio = len(high_regions) / len(FACE_REGIONS) if FACE_REGIONS else 0.0
 
-    score = (
-        0.50 * gan_probability +
-        0.30 * llava_c         +
-        0.10 * saliency_score  +
-        0.10 * high_ratio
-    )
+    if gradcam_is_placeholder:
+        # Grad-CAM not available — give its 50% weight entirely to LLaVA
+        score = (
+            0.80 * llava_c     +   # LLaVA carries 80%
+            0.10 * saliency_score + # still 0.5 but lower weight
+            0.10 * high_ratio
+        )
+    else:
+        score = (
+            0.50 * gan_probability +
+            0.30 * llava_c         +
+            0.10 * saliency_score  +
+            0.10 * high_ratio
+        )
     return round(float(np.clip(score, 0.0, 1.0)), 4)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN CLASS
@@ -459,14 +465,15 @@ class VLMAgent:
         # ── Path B: Grad-CAM placeholder ──────────────────────────────────
         logger.info("[VLMAgent] Running Grad-CAM (placeholder) ...")
         try:
-            cam_map, saliency_score, gan_probability = _run_gradcam_placeholder(
+            cam_map, saliency_score, gan_probability, gradcam_is_placeholder = _run_gradcam_placeholder(
                 face_crop_path
             )
         except Exception as exc:
             logger.error("[VLMAgent] Grad-CAM error: %s", exc)
-            cam_map, saliency_score, gan_probability = (
-                np.full((224, 224), 0.5, dtype=np.float32), 0.50, 0.50
-            )
+            cam_map         = np.full((224, 224), 0.5, dtype=np.float32)
+            saliency_score  = 0.50
+            gan_probability = 0.50
+            gradcam_is_placeholder = True   # ← add this
 
         # ── Zone classification ───────────────────────────────────────────
         try:
@@ -484,7 +491,7 @@ class VLMAgent:
 
         # ── Anomaly score ─────────────────────────────────────────────────
         anomaly_score = _compute_anomaly_score(
-            vlm_verdict, vlm_confidence, saliency_score, gan_probability, high_r
+            vlm_verdict, vlm_confidence, saliency_score, gan_probability, high_r, gradcam_is_placeholder=gradcam_is_placeholder
         )
 
         # ── Build and validate output ─────────────────────────────────────

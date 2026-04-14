@@ -46,6 +46,7 @@ shape_predictor_68_face_landmarks.dat.bz2
 *.bin
 *.safetensors
 *.onnx
+models/
 
 # Hugging Face Cache (models auto-download on first run)
 .cache/
@@ -66,6 +67,8 @@ test_outputs/
 .coverage
 htmlcov/
 tests/.pytest_cache/
+dataset/
+image.png
 
 # Logs
 *.log

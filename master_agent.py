@@ -155,40 +155,20 @@ def geometry_tool(image_path: str, face_bbox: list) -> dict:
 
 
 @tool
-def frequency_tool(image_path: str, face_bbox: list) -> dict:
+def frequency_tool(image_path: str) -> dict:
     """
-    FFT radial spectrum + Block DCT analysis. Returns fft_mid_anomaly_db,
-    fft_high_anomaly_db, anomaly_score.
+    FFT radial spectrum + SVM classifier. Returns fft_mid_anomaly_db,
+    fft_high_anomaly_db, svm_fake_probability, anomaly_score.
 
-    NOTE: frequency_agent.py expects a face_crop_path (pre-cropped image),
-    not a bbox. We crop here so the agent contract stays clean.
+    NOTE: frequency_agent.py handles its own face detection and
+    preprocessing internally. Pass the raw image path directly.
 
     Args:
         image_path: absolute path to original image.
-        face_bbox:  [x1, y1, x2, y2] from preprocessing.
     """
-    import cv2 as _cv2
     from agents.frequency_agent import run
 
-    img = _cv2.imread(image_path)
-    if img is None:
-        raise FileNotFoundError(f"frequency_tool: cannot read {image_path}")
-
-    x1, y1, x2, y2 = face_bbox
-    face_crop = img[y1:y2, x1:x2]
-
-    os.makedirs("temp", exist_ok=True)
-    crop_path = f"temp/freq_crop_{uuid.uuid4().hex[:8]}.jpg"
-    _cv2.imwrite(crop_path, face_crop)
-
-    result = run({"input_type": "face_crop", "path": crop_path})
-
-    # Clean up temp crop
-    try:
-        os.remove(crop_path)
-    except OSError:
-        pass
-
+    result = run({"input_type": "image", "path": image_path})
     return result
 
 
@@ -357,7 +337,7 @@ def _make_registry(state) -> list[dict]:
         {
             "name":          "frequency",
             "tool":          frequency_tool,
-            "invoke_args":   {"image_path": image_path, "face_bbox": face_bbox},
+            "invoke_args":   {"image_path": image_path},
             "score_key":     "anomaly_score",
             "fusion_module": "frequency",
             "enabled":       True,
