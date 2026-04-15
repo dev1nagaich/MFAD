@@ -68,6 +68,9 @@ test_outputs/
 htmlcov/
 tests/.pytest_cache/
 dataset/
+!dataset/DATASET_SUMMARY.md
+!dataset/samples/
+!dataset/samples/**
 image.png
 
 # Logs
