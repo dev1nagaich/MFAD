@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import random
 import time
 from pathlib import Path
@@ -153,6 +154,27 @@ class NPRDataset(Dataset):
 # Train / Val loops
 # ─────────────────────────────────────────────────────────────────────────────
 
+def atomic_save(obj, path: Path) -> None:
+    """Write to <path>.tmp then rename. Survives mid-write crashes — the
+    existing file is never half-overwritten."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def safe_load_resume(path: Path):
+    """Load a resume checkpoint. Returns None if missing/corrupt."""
+    if not path.exists() or path.stat().st_size < 1024:
+        return None
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as e:
+        log.warning("resume checkpoint %s unreadable (%s) — starting fresh", path, e)
+        return None
+
+
 def run_epoch(model, loader, optimizer, criterion, device, train: bool, desc: str):
     model.train(train)
     total_loss = 0.0
@@ -271,8 +293,35 @@ def main():
     args.out_weights.parent.mkdir(parents=True, exist_ok=True)
     history = []
     best_auc = -1.0
+    start_epoch = 1
 
-    for epoch in range(1, args.epochs + 1):
+    # ── Resume from last checkpoint if present ───────────────────────────────
+    resume_path = args.out_weights.with_name(args.out_weights.stem + ".last.pth")
+    state = safe_load_resume(resume_path)
+    if state is not None:
+        try:
+            model.load_state_dict(state["model"])
+            optimizer.load_state_dict(state["optimizer"])
+            scheduler.load_state_dict(state["scheduler"])
+            history     = state.get("history", [])
+            best_auc    = state.get("best_auc", -1.0)
+            start_epoch = state.get("epoch", 0) + 1
+            log.info(
+                "▶ Resuming from %s (epoch %d, best_auc=%.4f)",
+                resume_path, start_epoch - 1, best_auc,
+            )
+        except Exception as e:
+            log.warning("resume load failed (%s) — starting fresh", e)
+            start_epoch = 1
+            best_auc = -1.0
+            history = []
+
+    if start_epoch > args.epochs:
+        log.info("Already trained %d epochs (start_epoch=%d). Nothing to do.",
+                 args.epochs, start_epoch)
+        return
+
+    for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
         tr_loss, tr_auc, tr_f1, tr_acc = run_epoch(
             model, train_loader, optimizer, criterion, device, True, f"epoch {epoch} train")
@@ -295,8 +344,18 @@ def main():
 
         if vl_auc > best_auc:
             best_auc = vl_auc
-            torch.save(model.state_dict(), args.out_weights)
+            atomic_save(model.state_dict(), args.out_weights)
             log.info("  ✓ saved best (val AUC=%.4f) → %s", best_auc, args.out_weights)
+
+        # Always save resume checkpoint (full state, atomic write)
+        atomic_save({
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "best_auc": best_auc,
+            "history": history,
+        }, resume_path)
 
     history_path = args.out_weights.with_suffix(".history.json")
     with open(history_path, "w") as f:
