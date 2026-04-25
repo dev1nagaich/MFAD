@@ -199,11 +199,15 @@ def main():
     ap.add_argument("--num_workers", type=int, default=8)
     ap.add_argument("--val_frac", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--gpu", type=int, default=0,
+                    help="CUDA device index (set CUDA_VISIBLE_DEVICES externally if you prefer).")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
         raise RuntimeError("Training is GPU-only. CUDA not available.")
-    device = torch.device("cuda")
+    torch.cuda.set_device(args.gpu)
+    device = torch.device(f"cuda:{args.gpu}")
+    log.info("Using device cuda:%d (%s)", args.gpu, torch.cuda.get_device_name(args.gpu))
 
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)

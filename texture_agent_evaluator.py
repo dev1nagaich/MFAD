@@ -256,12 +256,17 @@ def main():
     ap.add_argument("--batch_size",   type=int, default=128)
     ap.add_argument("--num_workers",  type=int, default=8)
     ap.add_argument("--threshold",    type=float, default=0.5)
+    ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--out", type=Path, default=Path("outputs/texture_eval_report.json"))
     args = ap.parse_args()
 
     if not args.weights.exists():
         raise FileNotFoundError(f"Weights not found: {args.weights}")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args.gpu)
+        device = torch.device(f"cuda:{args.gpu}")
+    else:
+        device = torch.device("cpu")
     log.info("Device: %s", device)
 
     model = NPRDetector().to(device)

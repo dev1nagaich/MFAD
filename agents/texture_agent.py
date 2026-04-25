@@ -34,7 +34,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
-from torchvision.models import resnet50
+from torchvision.models.resnet import Bottleneck
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("texture_agent")
@@ -45,46 +45,84 @@ log = logging.getLogger("texture_agent")
 # ═════════════════════════════════════════════════════════════════════════════
 
 class NPRDetector(nn.Module):
-    """ResNet50 with NPR residual stem (matches official repo exactly).
+    """Official NPR architecture (Tan et al., CVPR 2024) — 1.44M params.
 
-    Official modifications vs. torchvision ResNet50:
-      • conv1 replaced with 3×3 stride-1 padding-1 (instead of 7×7 stride-2)
-      • fc replaced with Linear(2048, 1)
-      • forward replaces the input image with the NPR residual *2/3
+    Truncated ResNet50: only layer1 (3 Bottleneck) + layer2 (4 Bottleneck, stride 2).
+    Output of layer2 is 512 channels (Bottleneck expansion 4 × 128).
+
+      conv1: Conv2d(3, 64, k=3, s=2, p=1)
+      bn1, relu, maxpool(k=3, s=2, p=1)
+      layer1: 3× Bottleneck(64)
+      layer2: 4× Bottleneck(128, stride=2)
+      avgpool: AdaptiveAvgPool2d(1)
+      fc1:    Linear(512, 1)
+
+    Forward:
+      NPR = x - interpolate(x, 0.5)         # down-then-up nearest
+      out = network(NPR * 2/3)
     """
 
-    def __init__(self):
+    def __init__(self, num_classes: int = 1):
         super().__init__()
-        backbone = resnet50(weights=None)
-        backbone.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        backbone.fc = nn.Linear(2048, 1)
-        self.backbone = backbone
+        self.inplanes = 64
+        self.conv1   = nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn1     = nn.BatchNorm2d(64)
+        self.relu    = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1  = self._make_layer(Bottleneck, 64, 3)
+        self.layer2  = self._make_layer(Bottleneck, 128, 4, stride=2)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc1     = nn.Linear(512, num_classes)
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+        layers = [block(self.inplanes, planes, stride, downsample)]
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+        return nn.Sequential(*layers)
+
+    @staticmethod
+    def _interpolate(img: torch.Tensor, factor: float) -> torch.Tensor:
+        down = F.interpolate(img, scale_factor=factor, mode="nearest",
+                             recompute_scale_factor=True)
+        return F.interpolate(down, scale_factor=1.0 / factor, mode="nearest",
+                             recompute_scale_factor=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        npr = x - F.interpolate(
-            F.interpolate(x, scale_factor=0.5, recompute_scale_factor=True, mode="nearest"),
-            scale_factor=2, mode="nearest",
-        )
-        return self.backbone(npr * 2.0 / 3.0)
+        npr = x - self._interpolate(x, 0.5)
+        x = self.conv1(npr * 2.0 / 3.0)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        return self.fc1(x)
 
 
 def load_npr_state_dict(model: NPRDetector, weights_path: str) -> None:
-    """Load weights tolerant of `backbone.` prefix presence/absence."""
+    """Load NPR weights. Strips legacy `backbone.` and `module.` prefixes."""
     sd = torch.load(weights_path, map_location="cpu", weights_only=False)
     if isinstance(sd, dict) and "model" in sd and isinstance(sd["model"], dict):
         sd = sd["model"]
     if isinstance(sd, dict) and "state_dict" in sd and isinstance(sd["state_dict"], dict):
         sd = sd["state_dict"]
 
-    has_backbone = any(k.startswith("backbone.") for k in sd.keys())
-    has_module   = any(k.startswith("module.")   for k in sd.keys())
     new_sd = {}
     for k, v in sd.items():
         nk = k
-        if has_module and nk.startswith("module."):
+        if nk.startswith("module."):
             nk = nk[len("module."):]
-        if not has_backbone and not nk.startswith("backbone."):
-            nk = "backbone." + nk
+        if nk.startswith("backbone."):
+            nk = nk[len("backbone."):]
         new_sd[nk] = v
 
     missing, unexpected = model.load_state_dict(new_sd, strict=False)
