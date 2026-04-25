@@ -20,7 +20,7 @@ report_agent/__pycache__/
 *.so
 .Python
 *.egg
-
+checkpoints/
 # IDE & Editors
 .vscode/
 .idea/
