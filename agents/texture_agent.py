@@ -45,11 +45,18 @@ log = logging.getLogger("texture_agent")
 # ═════════════════════════════════════════════════════════════════════════════
 
 class NPRDetector(nn.Module):
-    """ResNet50 with NPR residual stem. Matches official repo forward exactly."""
+    """ResNet50 with NPR residual stem (matches official repo exactly).
+
+    Official modifications vs. torchvision ResNet50:
+      • conv1 replaced with 3×3 stride-1 padding-1 (instead of 7×7 stride-2)
+      • fc replaced with Linear(2048, 1)
+      • forward replaces the input image with the NPR residual *2/3
+    """
 
     def __init__(self):
         super().__init__()
         backbone = resnet50(weights=None)
+        backbone.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         backbone.fc = nn.Linear(2048, 1)
         self.backbone = backbone
 
