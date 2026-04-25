@@ -26,7 +26,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
 from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
 from tqdm import tqdm
@@ -235,10 +235,24 @@ def main():
              int((labels[train_idx] == 0).sum()),
              int((labels[train_idx] == 1).sum()))
 
-    train_ds = NPRDataset(paths[train_idx].tolist(), labels[train_idx].tolist(), train=True)
+    train_labels = labels[train_idx]
+    train_ds = NPRDataset(paths[train_idx].tolist(), train_labels.tolist(), train=True)
     val_ds   = NPRDataset(paths[val_idx].tolist(),   labels[val_idx].tolist(),   train=False)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+    # ── Class-balanced sampler — 1:1 real:fake per batch ─────────────────────
+    n_real = int((train_labels == 0).sum())
+    n_fake = int((train_labels == 1).sum())
+    class_w = {0: 1.0 / max(1, n_real), 1: 1.0 / max(1, n_fake)}
+    sample_w = np.array([class_w[int(c)] for c in train_labels], dtype=np.float64)
+    sampler = WeightedRandomSampler(
+        weights=torch.from_numpy(sample_w),
+        num_samples=len(sample_w),
+        replacement=True,
+    )
+    log.info("Class-balanced sampler enabled (real %d, fake %d → 1:1 batches)",
+             n_real, n_fake)
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler,
                               num_workers=args.num_workers, pin_memory=True, drop_last=True)
     val_loader   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                               num_workers=args.num_workers, pin_memory=True)
