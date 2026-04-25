@@ -1,352 +1,291 @@
-#!/usr/bin/env python
 """
-train_texture.py — Standalone trainer for the MFAD texture agent.
-═════════════════════════════════════════════════════════════════════════════
+train_texture.py — Fine-tune NPR (CVPR 2024) on texture-relevant subsets.
+═══════════════════════════════════════════════════════════════════════════════
 
-Strategy (texture-agent specific). The texture agent's UNIQUE signal in MFAD
-is the **face-swap boundary seam** at jaw↔neck: a sharp SSIM dissimilarity and
-EMD jump where the swapped face was blended onto the original frame. Other
-agents own the rest of the texture-adjacent failure modes:
+Initialises ResNet50 stem from official NPR.pth (ProGAN-trained), then
+fine-tunes on FF++ partial-swaps + StyleGAN + attribute-edit GANs.
 
-  • Frequency agent  → GAN spectral fingerprints / upsampling grids
-                       (100KFake, TPDNE, GAN-zoo)
-  • VLM agent        → diffusion semantic anomalies (Stable Diffusion family)
-  • Biological agent → mouth-only reenactments (Face2Face, NeuralTextures)
-  • Geometry agent   → attribute edits (AttGAN, STGAN, …)
-
-Bayesian fusion downstream lets each agent specialise. So texture trains ONLY
-on datasets where the boundary-seam signature is the dominant one:
-
-  Real anchors (label = 0)
-    • original              (FF++ real video frames — direct pair to FF++ fakes)
-    • Flickr-Faces-HQ_10K   (FFHQ — high-quality real anchor for generalisation)
-    • celebA-HQ_10K         (high-quality real anchor)
-
-  Fake anchors (label = 1)
-    • Deepfakes             (FF++ autoencoder face-swap — strong jaw seam)
-    • FaceSwap              (FF++ CG face-swap — sharp boundary)
-    • FaceShifter           (FF++ GAN face-swap — softer but visible seam)
-
-  Skipped on purpose
-    • 100KFake / TPDNE / GAN-zoo   → frequency agent's domain
-    • Stable Diffusion family      → VLM agent's domain
-    • Face2Face / NeuralTextures   → biological agent's domain
-    • AttGAN / STGAN / etc         → geometry agent's domain
-
-Output:
-    checkpoints/texture_checkpoint/texture_rf.pkl   {classifier, scaler}
-    checkpoints/texture_checkpoint/metrics.json
+GPU-only (A6000 target). Saves to checkpoints/texture_checkpoint/npr_finetuned.pth
 
 Usage:
-    python train_texture.py                    # default 3000/2000 per source
-    python train_texture.py --per-source-real 5000 --per-source-fake 3000
-    python train_texture.py --no-face-detect   # treat whole image as face
+  python train_texture.py --dataset_root /path/to/dataset \
+                          --epochs 10 --batch_size 64 --lr 2e-4
 """
+
 from __future__ import annotations
 
 import argparse
 import json
-import os
-import pickle
+import logging
 import random
-import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import List, Tuple
 
 import numpy as np
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
+import torch
+import torch.nn as nn
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
+from tqdm import tqdm
+
+from agents.texture_agent import NPRDetector, load_npr_state_dict
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-
-# Make `agents/` importable when running from project root.
-PROJECT_DIR = Path(__file__).parent.resolve()
-sys.path.insert(0, str(PROJECT_DIR))
-
-DATASET_ROOT = PROJECT_DIR / "dataset"
-CHECKPOINT_DIR = PROJECT_DIR / "checkpoints" / "texture_checkpoint"
-
-REAL_SOURCES = {
-    "FFpp_orig": "original",                # ← primary pair to FF++ fakes
-    "FFHQ":      "Flickr-Faces-HQ_10K",     # ← high-quality real generaliser
-    "celebAHQ":  "celebA-HQ_10K",           # ← high-quality real generaliser
-}
-FAKE_SOURCES = {
-    "Deepfakes":   "Deepfakes",             # ← FF++ autoencoder face-swap
-    "FaceSwap":    "FaceSwap",              # ← FF++ CG face-swap
-    "FaceShifter": "FaceShifter",           # ← FF++ GAN face-swap
-}
-
-IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
+log = logging.getLogger("train_texture")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Path collection
+# Texture-relevant training subsets
 # ─────────────────────────────────────────────────────────────────────────────
-def collect_image_paths(folder: Path, split: str, limit: int | None) -> list[Path]:
-    """Walk {folder}/{split} recursively and return up to `limit` image paths.
+TRAIN_REAL = [
+    ("original",            "flat"),   # FF++ original frames
+    ("Flickr-Faces-HQ_10K", "flat"),
+    ("celebA-HQ_10K",       "flat"),
+]
 
-    The repo's standard layout is `<folder>/{train,test}/<images-or-subdirs>`.
-    """
-    base = folder / split
-    if not base.exists():
+TRAIN_FAKE = [
+    ("Deepfakes",                   "flat"),
+    ("FaceSwap",                    "flat"),
+    ("FaceShifter",                 "flat"),
+    ("NeuralTextures",              "flat"),
+    ("100KFake_10K",                "flat"),
+    ("thispersondoesntexists_10K",  "flat"),
+    ("AttGAN",                      "split_fake"),  # AttGAN/<split>/1_fake/
+    ("STGAN",                       "split_fake"),
+    ("stargan",                     "split_fake"),
+]
+
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+
+
+def collect_image_paths(root: Path) -> List[Path]:
+    if not root.exists():
         return []
-    found: list[Path] = []
-    for root, _, files in os.walk(base):
-        for f in files:
-            if f.lower().endswith(IMG_EXTS):
-                found.append(Path(root) / f)
-    found.sort()
-    if limit and len(found) > limit:
-        rng = random.Random(42 + (hash(folder.name) & 0xFFFF))
-        rng.shuffle(found)
-        found = found[:limit]
-    return found
+    return [p for p in root.rglob("*") if p.suffix.lower() in IMAGE_EXTS]
+
+
+def build_split(dataset_root: Path, split: str) -> Tuple[List[Path], List[int]]:
+    """Returns (paths, labels). label 1=fake, 0=real."""
+    paths: List[Path] = []
+    labels: List[int] = []
+
+    def add(name: str, layout: str, label: int):
+        ds_root = dataset_root / name
+        if not ds_root.exists():
+            log.warning("Dataset folder missing: %s", ds_root)
+            return
+        if layout == "flat":
+            sub = ds_root / split
+            if not sub.exists():
+                sub = ds_root
+            files = collect_image_paths(sub)
+        elif layout == "split_fake":
+            sub = ds_root / split / "1_fake"
+            if not sub.exists():
+                alt = ds_root / "1_fake"
+                sub = alt if alt.exists() else ds_root / split
+            files = collect_image_paths(sub) if sub.exists() else []
+        else:
+            files = []
+        log.info("  %-30s %-12s %s → %d images", name, layout, split, len(files))
+        paths.extend(files)
+        labels.extend([label] * len(files))
+
+    log.info("REAL [%s]:", split)
+    for name, layout in TRAIN_REAL:
+        add(name, layout, label=0)
+    log.info("FAKE [%s]:", split)
+    for name, layout in TRAIN_FAKE:
+        add(name, layout, label=1)
+
+    return paths, labels
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Worker process state — initialised once per process via ProcessPoolExecutor
+# Dataset
 # ─────────────────────────────────────────────────────────────────────────────
-_AGENT = None
-_FACE_DETECTOR = None
-_USE_FACE_DETECT = False
 
-
-def _worker_init(use_face_detect: bool, project_dir: str) -> None:
-    """One-shot init: load the texture agent (and optional face detector)."""
-    sys.path.insert(0, project_dir)
-    global _AGENT, _FACE_DETECTOR, _USE_FACE_DETECT
-    from agents.texture_agent import TextureAgent
-    _AGENT = TextureAgent()
-    _USE_FACE_DETECT = use_face_detect
-    if use_face_detect:
-        try:
-            from texture_agent_evaluator import FaceDetector
-            _FACE_DETECTOR = FaceDetector(backend="opencv")
-        except Exception as e:
-            # Fall back to whole-image bbox if the detector cannot be built.
-            print(f"  [worker] face detector unavailable ({e!s}); using whole-image bbox.",
-                  file=sys.stderr, flush=True)
-            _FACE_DETECTOR = None
-            _USE_FACE_DETECT = False
-
-
-def _extract_features_for_image(item: tuple[str, int]) -> tuple[int, np.ndarray | None, str]:
-    """Worker function: open image, get bbox, run feature extraction.
-
-    Returns (label, 14-d feature vector or None, source path) so the parent can
-    log failures by file.
-    """
-    import cv2
-    import numpy as np
-    from PIL import Image
-    from agents.texture_agent import BoundingBox
-
-    path_str, label = item
-    try:
-        img = Image.open(path_str).convert("RGB")
-        w, h = img.size
-        bbox = None
-        if _USE_FACE_DETECT and _FACE_DETECTOR is not None:
-            arr_bgr = np.array(img)[:, :, ::-1]
-            try:
-                bboxes = _FACE_DETECTOR.detect(arr_bgr)
-                if bboxes:
-                    bbox = bboxes[0]
-            except Exception:
-                bbox = None
-        if bbox is None:
-            pad = int(min(w, h) * 0.05)
-            bbox = BoundingBox(x1=pad, y1=pad, x2=w - pad, y2=h - pad)
-
-        # Replicate the feature pipeline from TextureAgent.analyze without
-        # building the full TextureAnalysisResult.
-        img_rgb = np.array(img)
-        expanded = bbox.expand(0.05)
-        x1 = max(0, min(expanded.x1, w - 1))
-        y1 = max(0, min(expanded.y1, h - 1))
-        x2 = max(x1 + 1, min(expanded.x2, w))
-        y2 = max(y1 + 1, min(expanded.y2, h))
-        face_rgb = img_rgb[y1:y2, x1:x2]
-        if face_rgb.size < 256:
-            return label, None, path_str
-
-        face_bgr = cv2.cvtColor(face_rgb, cv2.COLOR_RGB2BGR)
-        face_gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
-
-        zone_lbp      = _AGENT._compute_zone_lbp(face_gray)
-        emd_scores    = _AGENT._compute_emd_matrix(zone_lbp)
-        npr_residuals = _AGENT._compute_npr_residuals(face_gray)
-        gabor_var     = _AGENT._compute_gabor_variance(face_gray)
-        seam_score, _ = _AGENT._detect_boundary_seams(face_bgr)
-        color_deltas  = _AGENT._compute_color_uniformity(face_rgb)
-
-        feat = _AGENT._extract_features(
-            emd_scores, npr_residuals, zone_lbp,
-            seam_score, color_deltas, gabor_var,
-        )
-        return label, np.asarray(feat, dtype=np.float32).ravel(), path_str
-    except Exception as exc:
-        return label, None, f"{path_str} ({exc!s})"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Dataset assembly + parallel feature extraction
-# ─────────────────────────────────────────────────────────────────────────────
-def gather_features(items, workers, use_face_detect):
-    feats: list[np.ndarray] = []
-    labels: list[int] = []
-    sources: list[str] = []
-    failures: list[str] = []
-    total = len(items)
-    t0 = time.time()
-    log_every = max(1, total // 20)
-
-    with ProcessPoolExecutor(
-        max_workers=workers,
-        initializer=_worker_init,
-        initargs=(use_face_detect, str(PROJECT_DIR)),
-    ) as pool:
-        futures = [pool.submit(_extract_features_for_image, it) for it in items]
-        done = 0
-        for fut in as_completed(futures):
-            label, feat, info = fut.result()
-            done += 1
-            if feat is None:
-                failures.append(info)
-            else:
-                feats.append(feat)
-                labels.append(label)
-                sources.append(info)
-            if done % log_every == 0 or done == total:
-                elapsed = time.time() - t0
-                rate = done / max(elapsed, 1e-6)
-                print(f"  features: {done}/{total} ({100*done/total:5.1f}%) "
-                      f"| {rate:5.1f} img/s | failures={len(failures)}", flush=True)
-
-    if not feats:
-        raise RuntimeError("No features extracted — every worker failed.")
-    return (
-        np.vstack(feats).astype(np.float32),
-        np.asarray(labels, dtype=np.int64),
-        sources,
-        failures,
+class NPRDataset(Dataset):
+    NORMALIZE = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225],
     )
+
+    def __init__(self, paths: List[Path], labels: List[int], train: bool):
+        self.paths = paths
+        self.labels = labels
+        if train:
+            self.tf = transforms.Compose([
+                transforms.Resize(288),
+                transforms.RandomCrop(256),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                self.NORMALIZE,
+            ])
+        else:
+            self.tf = transforms.Compose([
+                transforms.Resize((256, 256)),
+                transforms.ToTensor(),
+                self.NORMALIZE,
+            ])
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        try:
+            img = Image.open(self.paths[idx]).convert("RGB")
+            return self.tf(img), float(self.labels[idx])
+        except Exception as e:
+            log.warning("Failed to load %s: %s", self.paths[idx], e)
+            blank = Image.new("RGB", (256, 256))
+            return self.tf(blank), float(self.labels[idx])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Train / Val loops
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_epoch(model, loader, optimizer, criterion, device, train: bool, desc: str):
+    model.train(train)
+    total_loss = 0.0
+    all_y = []
+    all_p = []
+    pbar = tqdm(loader, desc=desc, ncols=100)
+    for x, y in pbar:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True).float().unsqueeze(1)
+
+        with torch.set_grad_enabled(train):
+            logit = model(x)
+            loss = criterion(logit, y)
+
+        if train:
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        total_loss += loss.item() * x.size(0)
+        all_y.append(y.detach().cpu().numpy())
+        all_p.append(torch.sigmoid(logit).detach().cpu().numpy())
+        pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+    y_arr = np.concatenate(all_y).ravel()
+    p_arr = np.concatenate(all_p).ravel()
+    avg_loss = total_loss / max(1, len(loader.dataset))
+    auc = roc_auc_score(y_arr, p_arr) if len(np.unique(y_arr)) > 1 else float("nan")
+    f1 = f1_score(y_arr, (p_arr >= 0.5).astype(int), zero_division=0)
+    acc = accuracy_score(y_arr, (p_arr >= 0.5).astype(int))
+    return avg_loss, auc, f1, acc
 
 
 def main():
-    ap = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter, description=__doc__)
-    ap.add_argument("--per-source-real", type=int, default=3000,
-                    help="Cap images per real source (3 sources → ~9k real total).")
-    ap.add_argument("--per-source-fake", type=int, default=3000,
-                    help="Cap images per fake source (3 sources → ~9k fake total).")
-    ap.add_argument("--workers", type=int, default=8)
-    ap.add_argument("--no-face-detect", action="store_true",
-                    help="Skip face detection (use whole image; fastest path for "
-                         "pre-cropped FFHQ/100KFake/TPDNE).")
-    ap.add_argument("--out", type=Path, default=CHECKPOINT_DIR / "texture_rf.pkl")
-    ap.add_argument("--metrics", type=Path, default=CHECKPOINT_DIR / "metrics.json")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset_root", required=True, type=Path)
+    ap.add_argument("--init_weights", type=Path,
+                    default=Path("checkpoints/texture_checkpoint/NPR.pth"))
+    ap.add_argument("--out_weights", type=Path,
+                    default=Path("checkpoints/texture_checkpoint/npr_finetuned.pth"))
+    ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--batch_size", type=int, default=64)
+    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--num_workers", type=int, default=8)
+    ap.add_argument("--val_frac", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
+    if not torch.cuda.is_available():
+        raise RuntimeError("Training is GPU-only. CUDA not available.")
+    device = torch.device("cuda")
 
-    print("=" * 72)
-    print("MFAD Texture Agent — Trainer")
-    print("=" * 72, flush=True)
+    random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
 
-    # ── 1. Collect paths ───────────────────────────────────────────────────────
-    print("\n[1/4] Collecting image paths …", flush=True)
-    items: list[tuple[str, int]] = []
-    real_counts: dict[str, int] = {}
-    for tag, folder_name in REAL_SOURCES.items():
-        paths = collect_image_paths(DATASET_ROOT / folder_name, "train", args.per_source_real)
-        real_counts[tag] = len(paths)
-        items.extend((str(p), 0) for p in paths)
-    fake_counts: dict[str, int] = {}
-    for tag, folder_name in FAKE_SOURCES.items():
-        paths = collect_image_paths(DATASET_ROOT / folder_name, "train", args.per_source_fake)
-        fake_counts[tag] = len(paths)
-        items.extend((str(p), 1) for p in paths)
+    log.info("Building train split from %s", args.dataset_root)
+    paths, labels = build_split(args.dataset_root, "train")
+    if not paths:
+        raise RuntimeError("No training images found. Check --dataset_root.")
 
-    print(f"  real:  {real_counts}  → total {sum(real_counts.values())}")
-    print(f"  fake:  {fake_counts}  → total {sum(fake_counts.values())}")
-    print(f"  combined: {len(items)} images", flush=True)
-    if not items:
-        sys.exit("No data found under dataset/ — aborting.")
+    paths = np.array(paths)
+    labels = np.array(labels)
+    rng = np.random.default_rng(args.seed)
+    val_idx = []
+    for c in (0, 1):
+        idx_c = np.where(labels == c)[0]
+        rng.shuffle(idx_c)
+        n_val = int(len(idx_c) * args.val_frac)
+        val_idx.extend(idx_c[:n_val].tolist())
+    val_set = set(val_idx)
+    train_idx = [i for i in range(len(paths)) if i not in val_set]
+    val_idx = sorted(val_set)
 
-    random.shuffle(items)
+    log.info("train=%d  val=%d  (real %d / fake %d in train)",
+             len(train_idx), len(val_idx),
+             int((labels[train_idx] == 0).sum()),
+             int((labels[train_idx] == 1).sum()))
 
-    # ── 2. Feature extraction ─────────────────────────────────────────────────
-    print(f"\n[2/4] Extracting features ({args.workers} workers, "
-          f"face_detect={'OFF' if args.no_face_detect else 'ON'}) …", flush=True)
-    X, y, _, failures = gather_features(items, args.workers, not args.no_face_detect)
-    print(f"  collected: {X.shape[0]} vectors of dim {X.shape[1]}, "
-          f"failures={len(failures)}", flush=True)
+    train_ds = NPRDataset(paths[train_idx].tolist(), labels[train_idx].tolist(), train=True)
+    val_ds   = NPRDataset(paths[val_idx].tolist(),   labels[val_idx].tolist(),   train=False)
 
-    # ── 3. Train classifier ───────────────────────────────────────────────────
-    print("\n[3/4] Training HistGradientBoostingClassifier …", flush=True)
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=0.2, random_state=args.seed, stratify=y,
-    )
-    scaler = StandardScaler().fit(X_tr)
-    X_tr_s = scaler.transform(X_tr)
-    X_te_s = scaler.transform(X_te)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                              num_workers=args.num_workers, pin_memory=True, drop_last=True)
+    val_loader   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                              num_workers=args.num_workers, pin_memory=True)
 
-    clf = HistGradientBoostingClassifier(
-        max_iter=500,
-        learning_rate=0.05,
-        max_depth=8,
-        l2_regularization=1e-3,
-        early_stopping=True,
-        validation_fraction=0.1,
-        class_weight="balanced",
-        random_state=args.seed,
-    )
-    t_train = time.time()
-    clf.fit(X_tr_s, y_tr)
-    t_train = time.time() - t_train
+    model = NPRDetector().to(device)
+    if args.init_weights.exists():
+        log.info("Loading init weights from %s", args.init_weights)
+        load_npr_state_dict(model, str(args.init_weights))
+    else:
+        log.warning("Init weights %s not found — training from scratch.", args.init_weights)
 
-    proba = clf.predict_proba(X_te_s)[:, 1]
-    pred = (proba >= 0.5).astype(int)
-    metrics = {
-        "auc_roc":   float(roc_auc_score(y_te, proba)),
-        "f1":        float(f1_score(y_te, pred)),
-        "accuracy":  float(accuracy_score(y_te, pred)),
-        "precision": float(precision_score(y_te, pred)),
-        "recall":    float(recall_score(y_te, pred)),
-        "n_train":   int(X_tr.shape[0]),
-        "n_test":    int(X_te.shape[0]),
-        "n_features": int(X_tr.shape[1]),
-        "real_counts": real_counts,
-        "fake_counts": fake_counts,
-        "failures":   len(failures),
-        "train_seconds": round(t_train, 2),
-        "model": "HistGradientBoostingClassifier(max_iter=500, lr=0.05, max_depth=8)",
-    }
-    print(f"  AUC-ROC : {metrics['auc_roc']:.4f}")
-    print(f"  F1      : {metrics['f1']:.4f}")
-    print(f"  Accuracy: {metrics['accuracy']:.4f}")
-    print(f"  Precision/Recall: {metrics['precision']:.4f} / {metrics['recall']:.4f}")
-    print(f"  trained in {t_train:.1f}s on {X_tr.shape[0]} samples", flush=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
+    criterion = nn.BCEWithLogitsLoss()
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    # ── 4. Save artefacts ─────────────────────────────────────────────────────
-    print(f"\n[4/4] Saving artefacts → {args.out.parent}/", flush=True)
-    with open(args.out, "wb") as f:
-        pickle.dump({"classifier": clf, "scaler": scaler}, f)
-    args.metrics.write_text(json.dumps(metrics, indent=2))
-    print(f"  classifier → {args.out}")
-    print(f"  metrics    → {args.metrics}")
-    print("\nDone.", flush=True)
+    args.out_weights.parent.mkdir(parents=True, exist_ok=True)
+    history = []
+    best_auc = -1.0
+
+    for epoch in range(1, args.epochs + 1):
+        t0 = time.time()
+        tr_loss, tr_auc, tr_f1, tr_acc = run_epoch(
+            model, train_loader, optimizer, criterion, device, True, f"epoch {epoch} train")
+        vl_loss, vl_auc, vl_f1, vl_acc = run_epoch(
+            model, val_loader, optimizer, criterion, device, False, f"epoch {epoch} val  ")
+        scheduler.step()
+        dt = time.time() - t0
+
+        log.info(
+            "epoch %d  | train loss=%.4f auc=%.4f f1=%.4f acc=%.4f  "
+            "| val loss=%.4f auc=%.4f f1=%.4f acc=%.4f  | %.1fs",
+            epoch, tr_loss, tr_auc, tr_f1, tr_acc, vl_loss, vl_auc, vl_f1, vl_acc, dt,
+        )
+        history.append({
+            "epoch": epoch,
+            "train": {"loss": tr_loss, "auc": tr_auc, "f1": tr_f1, "acc": tr_acc},
+            "val":   {"loss": vl_loss, "auc": vl_auc, "f1": vl_f1, "acc": vl_acc},
+            "seconds": dt,
+        })
+
+        if vl_auc > best_auc:
+            best_auc = vl_auc
+            torch.save(model.state_dict(), args.out_weights)
+            log.info("  ✓ saved best (val AUC=%.4f) → %s", best_auc, args.out_weights)
+
+    history_path = args.out_weights.with_suffix(".history.json")
+    with open(history_path, "w") as f:
+        json.dump({"best_val_auc": best_auc, "history": history,
+                   "args": {k: str(v) for k, v in vars(args).items()}}, f, indent=2)
+    log.info("history → %s", history_path)
+    log.info("Done. Best val AUC = %.4f", best_auc)
 
 
 if __name__ == "__main__":

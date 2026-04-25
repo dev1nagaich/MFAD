@@ -183,14 +183,12 @@ def frequency_tool(image_path: str, face_crop_path: str = "") -> dict:
 @tool
 def texture_tool(image_path: str, face_bbox: list) -> dict:
     """
-    Advanced texture forensics: TAD (Texture & Artifact Decomposition) + NPR.
-    
-    Per-zone analysis: EMD-based uniformity, LBP micro-texture variance, 
-    NPR upsampling artifacts, Gabor texture, boundary seams, color uniformity.
-    
-    Returns: jaw_emd, neck_emd, cheek_emd, lbp_uniformity, seam_detected,
-    zone_scores, zone_results (with per-zone detail), gram_distances, 
-    multi_scale_consistency, texture_fake_probability, is_fake, anomaly_score.
+    NPR (Tan et al., CVPR 2024) texture deepfake detector.
+    Single ResNet50 forward pass on the NPR residual of the face crop.
+
+    Returns: npr_fake_probability, texture_fake_probability, is_fake,
+    anomaly_score, model_name, model_version, inference_ms, analyst_note,
+    processing_notes.
 
     Args:
         image_path: absolute path to original image.
@@ -198,35 +196,31 @@ def texture_tool(image_path: str, face_bbox: list) -> dict:
     """
     from agents.texture_agent import TextureAgent, BoundingBox
     from PIL import Image
-    
+
     try:
-        # Load image
-        image = Image.open(image_path).convert('RGB')
-        
-        # Convert bbox to BoundingBox object
+        image = Image.open(image_path).convert("RGB")
         bbox = BoundingBox(
-            x1=int(face_bbox[0]),
-            y1=int(face_bbox[1]),
-            x2=int(face_bbox[2]),
-            y2=int(face_bbox[3])
+            x1=int(face_bbox[0]), y1=int(face_bbox[1]),
+            x2=int(face_bbox[2]), y2=int(face_bbox[3]),
         )
-        
-        # Run texture analysis
-        agent = TextureAgent()
-        result = agent.analyze(image, bbox)
-        
-        # Return as dict for LangChain compatibility
+        result = TextureAgent().analyze(image, bbox)
         return result.to_dict()
-    
+
     except Exception as e:
         log.error(f"Texture tool error: {e}", exc_info=True)
         import traceback
         return {
-            "anomaly_score": 0.5,
-            "error": str(e),
+            "npr_fake_probability":    0.5,
             "texture_fake_probability": 0.5,
-            "is_fake": False,
-            "traceback": traceback.format_exc()
+            "is_fake":                 False,
+            "anomaly_score":           0.5,
+            "model_name":              "NPR",
+            "model_version":           "unknown",
+            "inference_ms":            0.0,
+            "analyst_note":            f"Error: {e}",
+            "processing_notes":        [str(e)],
+            "error":                   str(e),
+            "traceback":               traceback.format_exc(),
         }
 
 
@@ -719,15 +713,17 @@ def report_node(state: MFADState) -> MFADState:
         "frequency_anomaly_score":  freq.get("anomaly_score"),
     })
 
-    # Texture fields
+    # Texture fields (NPR — Tan et al. CVPR 2024)
     tex = agent_outputs.get("texture", {})
     ctx.update({
-        "jaw_emd":               tex.get("jaw_emd"),
-        "neck_emd":              tex.get("neck_emd"),
-        "cheek_emd":             tex.get("cheek_emd"),
-        "lbp_uniformity":        tex.get("lbp_uniformity"),
-        "seam_detected":         tex.get("seam_detected"),
-        "texture_anomaly_score": tex.get("anomaly_score"),
+        "npr_fake_probability":     tex.get("npr_fake_probability"),
+        "texture_fake_probability": tex.get("texture_fake_probability"),
+        "texture_is_fake":          tex.get("is_fake"),
+        "texture_model_name":       tex.get("model_name"),
+        "texture_model_version":    tex.get("model_version"),
+        "texture_inference_ms":     tex.get("inference_ms"),
+        "texture_analyst_note":     tex.get("analyst_note"),
+        "texture_anomaly_score":    tex.get("anomaly_score"),
     })
 
     # VLM fields

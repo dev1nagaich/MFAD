@@ -62,33 +62,23 @@ FREQUENCY_KEYS = [
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AGENT 4 — TEXTURE + SKIN CONSISTENCY
+# AGENT 4 — TEXTURE
 # Maps to: §5.3 Texture Consistency & Skin-Tone Mapping
-# Implements TAD (Texture & Artifact Decomposition, Gao et al. EAAI 2024) and
-# NPR (Neighboring Pixel Relationships, Tan et al. CVPR 2024). The report
-# measures per-zone EMD for 5 distinct zone pairs — not a single score.
+# Implements NPR (Neighboring Pixel Relationships, Tan et al. CVPR 2024,
+# arXiv:2312.10461). ResNet50 backbone with NPR residual stem, fine-tuned on
+# texture-relevant subsets (FF++ partial-swaps + StyleGAN + attribute GANs).
+# Single forward pass — no per-zone hand-engineered metrics.
 # ─────────────────────────────────────────────────────────────────────────────
 TEXTURE_KEYS = [
-    # ── Core legacy scalars (report §5.3 table) ──
-    "jaw_emd",                    # float — EMD over LBP histograms at cheek↔jaw (authentic: <0.08)
-    "neck_emd",                   # float — EMD jaw↔neck boundary           (seam: >0.15)
-    "cheek_emd",                  # float — EMD cheek_L↔cheek_R              (authentic: <0.08)
-    "lbp_uniformity",             # float — overall LBP uniformity ratio     (authentic: >0.85)
-    "seam_detected",              # bool  — True if jaw↔neck seam SSIM-dissim > 0.15
-
-    # ── TAD + NPR extended metrics ──
-    "texture_fake_probability",   # float — calibrated [0,1] probability from weighted fusion or RF
-    "is_fake",                    # bool  — texture_fake_probability >= FINAL_DECISION (default 0.70)
-    "zone_results",               # dict  — per-zone {emd_score, lbp_uniformity, npr_residual,
-                                  #          texture_variance, color_delta_e, risk_level}
-    "zone_scores",                # dict  — zone_name → EMD scalar (legacy report shape)
-    "gram_distances",             # dict  — "zone_a↔zone_b" → L2 distance over color descriptors
-    "multi_scale_consistency",    # float — mean SSIM over down/up resampling [0,1]
-    "analyst_note",               # str   — human-readable forensic note
-    "processing_notes",           # list  — warnings/errors encountered while running
-
-    # ── Fusion key (§6 Bayesian ensemble) ──
-    "anomaly_score",              # float — [0,1] texture deepfake probability (§6 weight: 0.20)
+    "npr_fake_probability",       # float — sigmoid of NPR ResNet50 logit [0,1]; 1 = fake
+    "texture_fake_probability",   # float — alias of npr_fake_probability
+    "is_fake",                    # bool  — npr_fake_probability >= 0.50
+    "anomaly_score",              # float — [0,1] texture deepfake probability (§6 fusion weight: 0.20)
+    "model_name",                 # str   — "NPR"
+    "model_version",              # str   — e.g. "NPR-ResNet50-finetuned-v1"
+    "inference_ms",               # float — wall-clock inference latency, milliseconds
+    "analyst_note",               # str   — human-readable verdict line
+    "processing_notes",           # list  — warnings encountered while running
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
