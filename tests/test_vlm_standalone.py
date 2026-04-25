@@ -36,6 +36,7 @@ import sys
 import json
 import logging
 import shutil
+import argparse
 from pathlib import Path
 
 # ── path setup so we can import from the parent mfad/ directory ──────────────
@@ -199,14 +200,19 @@ def print_result(result: dict):
     print("=" * 60)
 
 
-def run_test():
+def run_test(image_path: str = None):
     """Full test sequence."""
     print("\n" + "=" * 60)
     print("  VLM AGENT STANDALONE TEST")
     print("=" * 60 + "\n")
 
     # Step 1: ensure test images exist
-    suspect_path, crop_path = ensure_test_images()
+    if image_path:
+        suspect_path = str(Path(image_path).resolve())
+        crop_path = suspect_path
+    else:
+        suspect_path, crop_path = ensure_test_images()
+
     logger.info("Using suspect image : %s", suspect_path)
     logger.info("Using face crop     : %s", crop_path)
 
@@ -255,12 +261,11 @@ def run_test():
         print(f"\n FAILED — anomaly_score {score} is outside [0, 1]\n")
         sys.exit(1)
 
-    print("\n  PASSED contract validation — all 10 VLM_KEYS present.")
-    print(f"  anomaly_score = {score} (in valid range [0, 1])")
-    print("\n  Grad-CAM is currently a placeholder.")
-    print("  When your teammate delivers EfficientNet-B4, replace")
-    print("  _run_gradcam_placeholder() in agents/vlm.py.\n")
 
 
 if __name__ == "__main__":
-    run_test()
+    parser = argparse.ArgumentParser(description="Standalone test for VLM Agent.")
+    parser.add_argument("--image", type=str, help="Path to a single image to test")
+    args = parser.parse_args()
+
+    run_test(args.image)

@@ -235,3 +235,15 @@ class GeometryAgent:
             "neck_face_boundary":    self._neck_face_boundary(pts, img),
             "overlay_image_path":    self._save_overlay(img, pts, image_path),
         }
+
+
+# ============================================================================ #
+#  Module-level entry point for LangChain tool wrapper                        #
+# ============================================================================ #
+def run(image_path: str, face_bbox: list) -> dict:
+    """
+    Module-level wrapper for GeometryAgent.run().
+    Instantiates the singleton GeometryAgent and delegates to its run method.
+    """
+    agent = GeometryAgent()
+    return agent.run(image_path, face_bbox)

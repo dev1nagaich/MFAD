@@ -57,29 +57,38 @@ GEOMETRY_KEYS = [
 # Maps to: §5.2 GAN Artefact & Frequency-Domain Analysis
 # ─────────────────────────────────────────────────────────────────────────────
 FREQUENCY_KEYS = [
-    "fft_mid_anomaly_db",       # float — PSD excess in 16-50 cycles/px band (dB)  (p<0.001 flag)
-    "fft_high_anomaly_db",      # float — PSD excess in 51-100 cycles/px band (dB) (p<0.001 flag)
-    "fft_ultrahigh_anomaly_db", # float — PSD excess in >100 cycles/px band (dB)   (StyleGAN2 sig.)
-    "gan_probability",          # float — EfficientNet-B4 (FF++ v3) GAN classifier [0,1]
-    "upsampling_grid_detected", # bool  — True if 4x4 px DCGAN grid artifact found in FFT
-    "anomaly_score",            # float — [0,1] combined frequency+GAN probability  (§6 weight: 0.25)
+    "freqnet_fake_probability",  # float — FreqNet deep-learning P(fake) [0,1]; 1 = fake
+    "anomaly_score",             # float — [0,1] FreqNet probability used by Bayesian fusion (§6 weight: 0.25)
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AGENT 4 — TEXTURE + SKIN CONSISTENCY
 # Maps to: §5.3 Texture Consistency & Skin-Tone Mapping
-# The report measures per-zone EMD for 5 distinct zone pairs — not a single score.
+# Implements TAD (Texture & Artifact Decomposition, Gao et al. EAAI 2024) and
+# NPR (Neighboring Pixel Relationships, Tan et al. CVPR 2024). The report
+# measures per-zone EMD for 5 distinct zone pairs — not a single score.
 # ─────────────────────────────────────────────────────────────────────────────
 TEXTURE_KEYS = [
-    "forehead_cheek_emd",    # float — EMD forehead <-> cheek (L)        (authentic: <0.08)
-    "cheek_jaw_emd_l",       # float — EMD cheek <-> jaw (L)             (authentic: <0.08)
-    "cheek_jaw_emd_r",       # float — EMD cheek <-> jaw (R)             (authentic: <0.08)
-    "periorbital_nasal_emd", # float — EMD periorbital <-> nasal bridge  (authentic: <0.08)
-    "lip_chin_emd",          # float — EMD upper lip <-> chin            (authentic: <0.08)
-    "neck_face_emd",         # float — EMD neck <-> face boundary        (authentic: <0.08; >0.15 = seam)
-    "lbp_uniformity",        # float — LBP uniformity ratio              (authentic: >0.85)
-    "seam_detected",         # bool  — True if any boundary EMD > 0.15
-    "anomaly_score",         # float — [0,1] texture deepfake probability (§6 weight: 0.20)
+    # ── Core legacy scalars (report §5.3 table) ──
+    "jaw_emd",                    # float — EMD over LBP histograms at cheek↔jaw (authentic: <0.08)
+    "neck_emd",                   # float — EMD jaw↔neck boundary           (seam: >0.15)
+    "cheek_emd",                  # float — EMD cheek_L↔cheek_R              (authentic: <0.08)
+    "lbp_uniformity",             # float — overall LBP uniformity ratio     (authentic: >0.85)
+    "seam_detected",              # bool  — True if jaw↔neck seam SSIM-dissim > 0.15
+
+    # ── TAD + NPR extended metrics ──
+    "texture_fake_probability",   # float — calibrated [0,1] probability from weighted fusion or RF
+    "is_fake",                    # bool  — texture_fake_probability >= FINAL_DECISION (default 0.70)
+    "zone_results",               # dict  — per-zone {emd_score, lbp_uniformity, npr_residual,
+                                  #          texture_variance, color_delta_e, risk_level}
+    "zone_scores",                # dict  — zone_name → EMD scalar (legacy report shape)
+    "gram_distances",             # dict  — "zone_a↔zone_b" → L2 distance over color descriptors
+    "multi_scale_consistency",    # float — mean SSIM over down/up resampling [0,1]
+    "analyst_note",               # str   — human-readable forensic note
+    "processing_notes",           # list  — warnings/errors encountered while running
+
+    # ── Fusion key (§6 Bayesian ensemble) ──
+    "anomaly_score",              # float — [0,1] texture deepfake probability (§6 weight: 0.20)
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -101,7 +110,7 @@ BIOLOGICAL_KEYS = [
 # ─────────────────────────────────────────────────────────────────────────────
 VLM_KEYS = [
     "heatmap_path",               # str   — path to Grad-CAM heatmap overlay PNG
-    "vlm_caption",                # str   — BLIP-2 structured forensic natural language finding
+    "vlm_caption",                # str   — LLaVA-1.5-7b structured forensic natural language finding
     "vlm_verdict",                # str   — "REAL" | "FAKE" | "UNCERTAIN" parsed from caption
     "vlm_confidence",             # float — confidence of vlm_verdict [0,1]
     "saliency_score",             # float — mean Grad-CAM activation over face bbox [0,1]
@@ -171,7 +180,7 @@ REPORT_KEYS = [
 # ─────────────────────────────────────────────────────────────────────────────
 MODULE_SCORE_KEYS = [
     "geometry",     # §5.1 Facial Geometry & Landmark Deviation
-    "gan_artefact", # §5.2 GAN Artefact Detection (EfficientNet-B4)
+    "gan_artefact", # §5.2 FFT+SVM GAN Artefact Detection
     "frequency",    # §5.2 Frequency-Domain Spectral Anomaly
     "texture",      # §5.3 Texture / Skin-Tone Consistency
     "vlm",          # §5.4 VLM Explainability Attention Score
@@ -237,13 +246,21 @@ AUTHENTIC_BASELINES = {
     "eye_aspect_ratio_max":          0.34,
     "lip_thickness_ratio_min":       0.18,
     "lip_thickness_ratio_max":       0.26,
-    # §5.2 Frequency
-    "fft_mid_anomaly_db_threshold":  3.0,
-    "fft_high_anomaly_db_threshold": 5.0,
-    # §5.3 Texture
-    "emd_max":                       0.08,
-    "seam_emd_threshold":            0.15,
-    "lbp_uniformity_min":            0.85,
+    # §5.2 Frequency (FreqNet)
+    "freqnet_fake_probability_threshold": 0.5,   # above → suspicious
+    # §5.3 Texture (TAD + NPR thresholds)
+    "emd_max":                       0.08,   # adjacent-zone EMD over LBP histograms
+    "emd_suspicious":                0.15,
+    "emd_anomalous":                 0.20,
+    "seam_emd_threshold":            0.15,   # jaw↔neck SSIM-dissimilarity → seam_detected
+    "lbp_uniformity_min":            0.85,   # below = suspicious; high uniformity = GAN over-smoothing
+    "lbp_uniformity_critical":       0.70,
+    "npr_authentic_max":             0.12,   # 4-conn vs 8-conn pixel-relation residual (NPR paper)
+    "npr_anomalous_min":             0.18,
+    "gabor_variance_min":            0.025,  # below = over-smooth (GAN)
+    "gabor_variance_critical":       0.015,
+    "color_delta_e_min":             3.0,    # CIE Lab ΔE; below = unnaturally uniform skin
+    "texture_decision_threshold":    0.70,   # texture_fake_probability ≥ this → IS_FAKE
     # §5.5 Biological (single-image pupil/cornea geometry — not physiological)
     "pupil_biou_min":                0.55,
     "corneal_reflex_iou_min":        0.15,
@@ -287,18 +304,12 @@ STUB_TEST_CASE_DFA_2025_TC_00471 = {
     "eye_aspect_ratio_r":       0.29,
     "lip_thickness_ratio":      0.22,
     "neck_face_boundary":       "sharp_edge",
-    # §5.2 Frequency
-    "fft_mid_anomaly_db":       9.4,
-    "fft_high_anomaly_db":      13.3,
-    "fft_ultrahigh_anomaly_db": 15.6,
-    "gan_probability":          0.967,
-    # §5.3 Texture — per zone
-    "forehead_cheek_emd":       0.061,
-    "cheek_jaw_emd_l":          0.193,
-    "cheek_jaw_emd_r":          0.211,
-    "periorbital_nasal_emd":    0.072,
-    "lip_chin_emd":             0.148,
-    "neck_face_emd":            0.274,
+    # §5.2 Frequency (FreqNet)
+    "freqnet_fake_probability": 0.912,
+    # §5.3 Texture
+    "jaw_emd":                  0.193,
+    "neck_emd":                 0.274,
+    "cheek_emd":                0.211,
     "lbp_uniformity":           0.51,
     # §5.5 Biological
     "rppg_snr":                 0.09,

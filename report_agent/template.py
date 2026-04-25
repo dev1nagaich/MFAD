@@ -5,7 +5,7 @@ report/template.py
 ReportLab PDF layout engine for the forensic report.
 Maps to §8 Legal Certification + §9–§10 Analyst Declaration of reference report DFA-2025-TC-00471.
 
-Design: Dark forensic aesthetic — deep navy + electric cyan accents.
+Design: Warm forensic aesthetic — French Beige + black accents.
 Every section maps directly to a measurement or finding from the reference report.
 """
 
@@ -36,20 +36,21 @@ from reportlab.platypus.flowables import BalancedColumns
 
 class T:
     """Design token namespace."""
-    # Colours
-    NAVY        = colors.HexColor("#0A0E1A")   # page background feel (used in header/footer)
-    NAVY_MID    = colors.HexColor("#0F1628")   # section header bg
-    NAVY_LIGHT  = colors.HexColor("#1A2340")   # table row alt bg
-    CYAN        = colors.HexColor("#00D4FF")   # accent / highlight
-    CYAN_DIM    = colors.HexColor("#0099BB")   # secondary accent
+    # Colours — Midnight Professional Palette
+    NAVY        = colors.HexColor("#0F172A")   # Rich Dark Navy (Cover / Primary)
+    NAVY_MID    = colors.HexColor("#1E3A5F")   # Steel Blue (Headers)
+    NAVY_LIGHT  = colors.HexColor("#F1F5F9")   # Ghost Blue (Alt rows)
+    ACCENT      = colors.HexColor("#94A3B8")   # Classy Steel Accent (for corners)
+    CYAN        = colors.HexColor("#F8FAFC")   # High-contrast White for dark bg
+    CYAN_DIM    = colors.HexColor("#CBD5E1")   # Subtle Light Slate
     WHITE       = colors.HexColor("#FFFFFF")
-    OFF_WHITE   = colors.HexColor("#E8EDF5")
-    GREY_LIGHT  = colors.HexColor("#C5CDD8")
-    GREY_MID    = colors.HexColor("#8899AA")
-    RED_ALERT   = colors.HexColor("#FF3B5C")   # DEEPFAKE verdict
-    ORANGE_WARN = colors.HexColor("#FF8C00")   # UNCERTAIN verdict
-    GREEN_OK    = colors.HexColor("#00C47A")   # AUTHENTIC verdict
-    BORDER      = colors.HexColor("#1E2D50")   # table border
+    OFF_WHITE   = colors.HexColor("#F8FAFC")   # Paper White (Background)
+    GREY_LIGHT  = colors.HexColor("#E2E8F0")   # Border / Dividers
+    GREY_MID    = colors.HexColor("#475569")   # Slate Gray (Body text on white)
+    RED_ALERT   = colors.HexColor("#EF4444")   # DEEPFAKE alert
+    ORANGE_WARN = colors.HexColor("#F59E0B")   # UNCERTAIN warn
+    GREEN_OK    = colors.HexColor("#10B981")   # AUTHENTIC ok
+    BORDER      = colors.HexColor("#E2E8F0")   # Slate border
 
     # Typography — Helvetica family (always available in ReportLab)
     FONT_BODY   = "Helvetica"
@@ -63,6 +64,32 @@ class T:
     MARGIN_T    = 22 * mm
     MARGIN_B    = 22 * mm
     CONTENT_W   = PAGE_W - MARGIN_L - MARGIN_R
+
+
+# ─────────────────────────────────────────────
+#  DECIMAL PRECISION HELPER
+# ─────────────────────────────────────────────
+
+def _fmt(val, dp=6):
+    """Format a numeric value to at most `dp` decimal places. Non-numeric passes through."""
+    if val is None or val == "N/A":
+        return "N/A"
+    try:
+        f = float(val)
+        # If it is an integer-like value, show without unnecessary decimals
+        if f == int(f) and abs(f) < 1e12:
+            return str(int(f))
+        formatted = f"{f:.{dp}f}"
+        # Strip trailing zeros but keep at least one decimal
+        formatted = formatted.rstrip('0').rstrip('.')
+        return formatted
+    except (ValueError, TypeError):
+        return str(val)
+
+
+def _p(text, style):
+    """Wrap text in a Paragraph to ensure automatic word wrapping in Table cells."""
+    return Paragraph(str(text), style)
 
 
 # ─────────────────────────────────────────────
@@ -103,7 +130,7 @@ def build_styles():
         "section_heading",
         fontName=T.FONT_BOLD,
         fontSize=10,
-        textColor=T.CYAN,
+        textColor=T.NAVY_MID,
         leading=14,
         spaceBefore=6 * mm,
         spaceAfter=3 * mm,
@@ -113,7 +140,7 @@ def build_styles():
         "body",
         fontName=T.FONT_BODY,
         fontSize=8.5,
-        textColor=colors.HexColor("#1A1A2E"),
+        textColor=T.GREY_MID,
         leading=13,
         alignment=TA_JUSTIFY,
         spaceAfter=2 * mm,
@@ -146,7 +173,7 @@ def build_styles():
         "mono",
         fontName="Courier",
         fontSize=7.5,
-        textColor=T.CYAN_DIM,
+        textColor=T.GREY_MID,
         leading=11,
     )
     styles["verdict_fake"] = ParagraphStyle(
@@ -177,7 +204,7 @@ def build_styles():
         "table_header",
         fontName=T.FONT_BOLD,
         fontSize=7.5,
-        textColor=T.CYAN,
+        textColor=T.WHITE,
         leading=11,
         tracking=1,
     )
@@ -229,7 +256,7 @@ class CyanRule(Flowable):
         self.height = self.thickness + 2
 
     def draw(self):
-        self.canv.setStrokeColor(self.color)
+        self.canv.setStrokeColor(T.NAVY_MID)
         self.canv.setLineWidth(self.thickness)
         self.canv.line(0, self.thickness / 2, self.width, self.thickness / 2)
 
@@ -254,8 +281,8 @@ class SectionHeader(Flowable):
         c.setFillColor(T.NAVY_MID)
         c.roundRect(0, 0, w, h, 2, fill=1, stroke=0)
 
-        # Left cyan accent stripe
-        c.setFillColor(T.CYAN)
+        # Left accent stripe
+        c.setFillColor(T.CYAN_DIM)
         c.rect(0, 0, 3, h, fill=1, stroke=0)
 
         # Section title text
@@ -298,10 +325,13 @@ class ScoreBar(Flowable):
         bar_h = 4.5
         y_center = self.height / 2
 
-        # Label
-        c.setFillColor(colors.HexColor("#333355"))
-        c.setFont(T.FONT_BODY, 8)
-        c.drawString(0, y_center - 3, self.label)
+        # Label (truncated if too long to prevent overlap)
+        c.setFillColor(T.GREY_MID)
+        c.setFont(T.FONT_BODY, 7.5)
+        label_txt = self.label
+        if len(label_txt) > 35:
+            label_txt = label_txt[:32] + "..."
+        c.drawString(0, y_center - 3, label_txt)
 
         # Track (empty bar)
         c.setFillColor(colors.HexColor("#D8DCE8"))
@@ -421,9 +451,10 @@ class KeyValueBlock(Flowable):
     Compact two-column key-value block for metadata fields.
     Used for chain-of-custody fields, EXIF fields, etc.
     """
-    def __init__(self, pairs, width=None):
+    def __init__(self, pairs, styles, width=None):
         super().__init__()
         self.pairs = pairs  # list of (label, value, flag?) tuples
+        self.styles = styles
         self.width = width or T.CONTENT_W
         self.row_h = 7 * mm
         self.height = len(pairs) * self.row_h
@@ -451,15 +482,17 @@ class KeyValueBlock(Flowable):
             c.line(0, y, self.width, y)
 
             # Label
-            c.setFillColor(T.GREY_MID)
-            c.setFont(T.FONT_BOLD, 7.5)
-            c.drawString(4, y + self.row_h / 2 - 3.5, label)
+            label_p = _p(label, self.styles["label"])
+            label_p.wrap(col1 - 8, self.row_h)
+            label_p.drawOn(c, 4, y + 2)
 
-            # Value
-            val_color = T.RED_ALERT if flagged else colors.HexColor("#1A1A2E")
-            c.setFillColor(val_color)
-            c.setFont("Courier" if flagged else T.FONT_BODY, 8)
-            c.drawString(col1 + 4, y + self.row_h / 2 - 3.5, value)
+            # Value (wrapped)
+            val_style = ParagraphStyle("keyval_val", parent=self.styles["value"],
+                                        textColor=T.RED_ALERT if flagged else T.NAVY_MID,
+                                        fontSize=7.5)
+            val_p = _p(value, val_style)
+            val_p.wrap(col2 - 12, self.row_h)
+            val_p.drawOn(c, col1 + 4, y + 2)
 
             # Flag indicator dot
             if flagged:
@@ -480,8 +513,8 @@ def _draw_cover_page(c, doc):
     c.setFillColor(T.NAVY)
     c.rect(0, 0, w, h, fill=1, stroke=0)
 
-    # Diagonal cyan accent stripe (top-right corner design element)
-    c.setFillColor(colors.HexColor("#001822"))
+    # Diagonal "Classy Steel" accent stripe (top-right corner)
+    c.setFillColor(T.ACCENT)
     p = c.beginPath()
     p.moveTo(w * 0.5, h)
     p.lineTo(w, h)
@@ -640,8 +673,8 @@ def _build_cover(ctx, styles):
 
     for label, value in meta_rows:
         row_data = [[
-            Paragraph(label, cover_label_style),
-            Paragraph(str(value), cover_value_style),
+            _p(label, cover_label_style),
+            _p(str(value), cover_value_style),
         ]]
         t = Table(row_data, colWidths=[T.CONTENT_W * 0.35, T.CONTENT_W * 0.65])
         t.setStyle(TableStyle([
@@ -649,7 +682,7 @@ def _build_cover(ctx, styles):
             ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
             ("TOPPADDING",    (0, 0), (-1, -1), 3),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-            ("LINEBELOW",     (0, 0), (-1, -1), 0.4, colors.HexColor("#1E2D50")),
+            ("LINEBELOW",     (0, 0), (-1, -1), 0.4, T.ACCENT),
             ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
         ]))
         story.append(t)
@@ -704,7 +737,7 @@ def _build_chain_of_custody(ctx, styles):
         ("Face Crop Path",      str(ctx.get("face_crop_path", "N/A")),     False),
         ("Normalized Path",     str(ctx.get("normalized_path", "N/A")),    False),
     ]
-    story.append(KeyValueBlock(pairs))
+    story.append(KeyValueBlock(pairs, styles))
     story.append(Spacer(1, 4 * mm))
     return story
 
@@ -723,31 +756,31 @@ def _build_per_module_findings(ctx, styles):
     geo_data = [
         ["Metric", "Measured Value", "Authentic Baseline", "Status"],
         ["Symmetry Index",
-         f"{ctx.get('symmetry_index', 'N/A')}",
+         _fmt(ctx.get('symmetry_index', 'N/A')),
          "0.92 – 1.00",
          "⚠ ANOMALOUS" if float(ctx.get('symmetry_index', 1) or 1) < 0.92 else "✓ NORMAL"],
         ["Jaw Curvature (°)",
-         f"{ctx.get('jaw_curvature_deg', 'N/A')}",
+         _fmt(ctx.get('jaw_curvature_deg', 'N/A')),
          "< 5°",
          "⚠ ANOMALOUS" if float(ctx.get('jaw_curvature_deg', 0) or 0) > 5 else "✓ NORMAL"],
         ["Ear Alignment (px)",
-         f"{ctx.get('ear_alignment_px', 'N/A')}",
+         _fmt(ctx.get('ear_alignment_px', 'N/A')),
          "< 3 px",
          "⚠ ANOMALOUS" if float(ctx.get('ear_alignment_px', 0) or 0) > 3 else "✓ NORMAL"],
         ["Philtrum Length (mm)",
-         f"{ctx.get('philtrum_length_mm', 'N/A')}",
+         _fmt(ctx.get('philtrum_length_mm', 'N/A')),
          "11 – 18 mm",
          "—"],
         ["Inter-ocular Dist (px)",
-         f"{ctx.get('interocular_dist_px', 'N/A')}",
+         _fmt(ctx.get('interocular_dist_px', 'N/A')),
          "58 – 72 px",
          "—"],
         ["Eye Aspect Ratio L/R",
-         f"{ctx.get('eye_aspect_ratio_l','N/A')} / {ctx.get('eye_aspect_ratio_r','N/A')}",
+         f"{_fmt(ctx.get('eye_aspect_ratio_l','N/A'))} / {_fmt(ctx.get('eye_aspect_ratio_r','N/A'))}",
          "0.28 – 0.34",
          "—"],
         ["Lip Thickness Ratio",
-         f"{ctx.get('lip_thickness_ratio', 'N/A')}",
+         _fmt(ctx.get('lip_thickness_ratio', 'N/A')),
          "0.18 – 0.26",
          "—"],
         ["Neck-Face Boundary",
@@ -755,14 +788,16 @@ def _build_per_module_findings(ctx, styles):
          "smooth",
          "⚠ ANOMALOUS" if str(ctx.get('neck_face_boundary', '')) == "sharp_edge" else "✓ NORMAL"],
         ["Anomaly Score",
-         f"{ctx.get('geometry_anomaly_score', ctx.get('anomaly_score', 'N/A'))}",
+         _fmt(ctx.get('geometry_anomaly_score', ctx.get('anomaly_score', 'N/A'))),
          "< 0.35 = authentic",
          ""],
     ]
     col_w = [T.CONTENT_W * 0.36, T.CONTENT_W * 0.22, T.CONTENT_W * 0.25, T.CONTENT_W * 0.17]
-    geo_table = Table(geo_data, colWidths=col_w)
+    geo_table_data = [[_p(cell, styles["table_header"] if i == 0 else styles["table_cell"])
+                       for cell in row] for i, row in enumerate(geo_data)]
+    geo_table = Table(geo_table_data, colWidths=col_w)
     geo_table.setStyle(_std_table_style())
-    # Colour status column
+    # Color status column
     for i, row in enumerate(geo_data[1:], 1):
         status = row[3]
         if "ANOMALOUS" in status:
@@ -779,26 +814,16 @@ def _build_per_module_findings(ctx, styles):
 
     freq_data = [
         ["Metric", "Value", "Interpretation"],
-        ["FFT Mid-Band Anomaly (16–50 cyc/px)",
-         f"{ctx.get('fft_mid_anomaly_db', 'N/A')} dB",
-         "GAN upsampling leaves +ve excess here"],
-        ["FFT High-Band Anomaly (51–100 cyc/px)",
-         f"{ctx.get('fft_high_anomaly_db', 'N/A')} dB",
-         "p < 0.001 flag if positive"],
-        ["FFT Ultra-High (>100 cyc/px)",
-         f"{ctx.get('fft_ultrahigh_anomaly_db', 'N/A')} dB",
-         "StyleGAN2 signature (+15.6 dB in reference)"],
-        ["GAN Probability (EfficientNet-B4)",
-         f"{float(ctx.get('gan_probability', 0))*100:.1f}%",
-         "FaceForensics++ v3 fine-tuned classifier"],
-        ["Upsampling Grid Detected",
-         str(ctx.get('upsampling_grid_detected', 'N/A')),
-         "4×4 px DCGAN transposed-conv artefact"],
+        ["FreqNet Fake Probability",
+         f"{_fmt(float(ctx.get('freqnet_fake_probability', 0))*100, 1)}%",
+         "FreqNet deep-learning model; >50% = deepfake signal"],
         ["Frequency Anomaly Score",
-         str(ctx.get('frequency_anomaly_score', ctx.get('freq_anomaly_score', 'N/A'))),
-         "Combined FFT + GAN signal"],
+         _fmt(ctx.get('frequency_anomaly_score', ctx.get('anomaly_score', 'N/A'))),
+         "FreqNet sigmoid output (same value, used by Bayesian fusion)"],
     ]
-    freq_table = Table(freq_data,
+    freq_table_data = [[_p(cell, styles["table_header"] if i == 0 else styles["table_cell"])
+                        for cell in row] for i, row in enumerate(freq_data)]
+    freq_table = Table(freq_table_data,
                        colWidths=[T.CONTENT_W * 0.42, T.CONTENT_W * 0.2, T.CONTENT_W * 0.38])
     freq_table.setStyle(_std_table_style())
     story.append(freq_table)
@@ -810,30 +835,23 @@ def _build_per_module_findings(ctx, styles):
 
     tex_data = [
         ["Zone Pair", "EMD Score", "Baseline", "Flag"],
-        ["Forehead ↔ Cheek",
-         f"{ctx.get('forehead_cheek_emd', 'N/A')}",
-         "< 0.08", "⚠" if float(ctx.get('forehead_cheek_emd', 0) or 0) > 0.08 else "✓"],
-        ["Cheek ↔ Jaw (Left)",
-         f"{ctx.get('cheek_jaw_emd_l', 'N/A')}",
-         "< 0.08", "⚠" if float(ctx.get('cheek_jaw_emd_l', 0) or 0) > 0.08 else "✓"],
-        ["Cheek ↔ Jaw (Right)",
-         f"{ctx.get('cheek_jaw_emd_r', 'N/A')}",
-         "< 0.08", "⚠" if float(ctx.get('cheek_jaw_emd_r', 0) or 0) > 0.08 else "✓"],
-        ["Periorbital ↔ Nasal Bridge",
-         f"{ctx.get('periorbital_nasal_emd', 'N/A')}",
-         "< 0.08", "⚠" if float(ctx.get('periorbital_nasal_emd', 0) or 0) > 0.08 else "✓"],
-        ["Upper Lip ↔ Chin",
-         f"{ctx.get('lip_chin_emd', 'N/A')}",
-         "< 0.08", "⚠" if float(ctx.get('lip_chin_emd', 0) or 0) > 0.08 else "✓"],
+        ["Jaw (L/R boundary)",
+         _fmt(ctx.get('jaw_emd', 'N/A')),
+         "< 0.08", "⚠" if float(ctx.get('jaw_emd', 0) or 0) > 0.08 else "✓"],
         ["Neck ↔ Face",
-         f"{ctx.get('neck_face_emd', 'N/A')}",
+         _fmt(ctx.get('neck_emd', 'N/A')),
          "< 0.15 (primary seam indicator)",
-         "⚠ SEAM" if float(ctx.get('neck_face_emd', 0) or 0) > 0.15 else "✓"],
-        ["LBP Uniformity", f"{ctx.get('lbp_uniformity', 'N/A')}",
+         "⚠ SEAM" if float(ctx.get('neck_emd', 0) or 0) > 0.15 else "✓"],
+        ["Cheek (L/R)",
+         _fmt(ctx.get('cheek_emd', 'N/A')),
+         "< 0.08", "⚠" if float(ctx.get('cheek_emd', 0) or 0) > 0.08 else "✓"],
+        ["LBP Uniformity", _fmt(ctx.get('lbp_uniformity', 'N/A')),
          "> 0.85", "⚠" if float(ctx.get('lbp_uniformity', 1) or 1) < 0.85 else "✓"],
         ["Seam Detected", str(ctx.get('seam_detected', 'N/A')), "False", ""],
     ]
-    tex_table = Table(tex_data,
+    tex_table_data = [[_p(cell, styles["table_header"] if i == 0 else styles["table_cell"])
+                        for cell in row] for i, row in enumerate(tex_data)]
+    tex_table = Table(tex_table_data,
                       colWidths=[T.CONTENT_W*0.36, T.CONTENT_W*0.2, T.CONTENT_W*0.31, T.CONTENT_W*0.13])
     tex_table.setStyle(_std_table_style())
     story.append(tex_table)
@@ -845,16 +863,18 @@ def _build_per_module_findings(ctx, styles):
 
     vlm_data = [
         ["Field", "Value"],
-        ["VLM Verdict",       str(ctx.get("vlm_verdict", "N/A"))],
-        ["VLM Confidence",    f"{float(ctx.get('vlm_confidence', 0))*100:.1f}%"],
-        ["Saliency Score",    str(ctx.get("saliency_score", "N/A"))],
+        ["LLaVA-1.5-7b Verdict",  str(ctx.get("vlm_verdict", "N/A"))],
+        ["LLaVA-1.5-7b Confidence", f"{float(ctx.get('vlm_confidence', 0))*100:.1f}%"],
+        ["Saliency Score",    _fmt(ctx.get("saliency_score", "N/A"))],
         ["Zone GAN Prob.",    f"{float(ctx.get('zone_gan_probability', 0))*100:.1f}%"],
         ["High Activation",   ", ".join(ctx.get("high_activation_regions", []))  or "—"],
         ["Mid Activation",    ", ".join(ctx.get("medium_activation_regions", [])) or "—"],
         ["Low Activation",    ", ".join(ctx.get("low_activation_regions", []))   or "—"],
-        ["VLM Caption",       str(ctx.get("vlm_caption", "N/A"))],
+        ["LLaVA-1.5-7b Caption", str(ctx.get("vlm_caption", "N/A"))],
     ]
-    vlm_table = Table(vlm_data, colWidths=[T.CONTENT_W * 0.30, T.CONTENT_W * 0.70])
+    vlm_table_data = [[_p(cell, styles["table_header"] if i == 0 else styles["table_cell"])
+                        for cell in row] for i, row in enumerate(vlm_data)]
+    vlm_table = Table(vlm_table_data, colWidths=[T.CONTENT_W * 0.30, T.CONTENT_W * 0.70])
     vlm_table.setStyle(_std_table_style())
     story.append(vlm_table)
     story.append(Spacer(1, 3 * mm))
@@ -863,7 +883,7 @@ def _build_per_module_findings(ctx, styles):
     heatmap_path = ctx.get("heatmap_path", "")
     story.append(HeatmapEmbed(
         path=str(heatmap_path),
-        caption="Figure 1 — Grad-CAM activation overlay on EfficientNet-B4 (FF++ v3). "
+        caption="Figure 1 — LLaVA-1.5-7b attention activation overlay. "
                 "RED = high activation (critical deepfake features). "
                 "BLUE = secondary manipulation zone.",
     ))
@@ -875,31 +895,33 @@ def _build_per_module_findings(ctx, styles):
 
     bio_data = [
         ["Signal", "Measured", "Authentic Baseline", "Finding"],
-        ["rPPG Cardiac SNR",
-         str(ctx.get("rppg_snr", "N/A")),
-         "> 0.45",
-         "ABSENT" if float(ctx.get("rppg_snr", 1) or 1) < 0.45 else "PRESENT"],
-        ["Corneal Highlight Deviation (°)",
-         str(ctx.get("corneal_deviation_deg", "N/A")),
-         "< 5°",
-         "COMPOSITE ILLUMINATION" if float(ctx.get("corneal_deviation_deg", 0) or 0) > 5 else "CONSISTENT"],
-        ["Perioral Micro-texture Variance",
-         str(ctx.get("micro_texture_var", "N/A")),
-         "~0.031 (mean)",
-         "GAN SMOOTHED" if float(ctx.get("micro_texture_var", 0.031) or 0.031) < 0.020 else "NORMAL"],
-        ["Vascular Pearson r",
-         str(ctx.get("vascular_pearson_r", "N/A")),
-         "> 0.88",
-         "MISMATCH" if float(ctx.get("vascular_pearson_r", 1) or 1) < 0.88 else "MATCH"],
+        ["Pupil Boundary IoU (BIoU)",
+         _fmt(ctx.get("pupil_biou", "N/A")),
+         "> 0.55",
+         "IRREGULAR PUPIL" if float(ctx.get("pupil_biou", 1) or 1) < 0.55 else "REGULAR"],
+        ["Corneal Reflection L/R IoU",
+         _fmt(ctx.get("corneal_reflex_iou", "N/A")),
+         "> 0.15",
+         "COMPOSITE ILLUMINATION" if float(ctx.get("corneal_reflex_iou", 1) or 1) < 0.15 else "CONSISTENT"],
+        ["Pupil Contour Solidity",
+         _fmt(ctx.get("pupil_solidity", "N/A")),
+         "> 0.90",
+         "OVER-SMOOTHED" if float(ctx.get("pupil_solidity", 1) or 1) < 0.90 else "NORMAL"],
+        ["Corneal Reflection Pixel Count",
+         _fmt(ctx.get("reflection_count", "N/A")),
+         ">= 4",
+         "MISSING REFLECTIONS" if int(ctx.get("reflection_count", 0) or 0) < 4 else "PRESENT"],
         ["Biological Anomaly Score",
-         str(ctx.get("biological_anomaly_score", ctx.get("anomaly_score", "N/A"))),
+         _fmt(ctx.get("biological_anomaly_score", ctx.get("anomaly_score", "N/A"))),
          "", ""],
     ]
-    bio_table = Table(bio_data,
+    bio_table_data = [[_p(cell, styles["table_header"] if i == 0 else styles["table_cell"])
+                        for cell in row] for i, row in enumerate(bio_data)]
+    bio_table = Table(bio_table_data,
                       colWidths=[T.CONTENT_W*0.38, T.CONTENT_W*0.18, T.CONTENT_W*0.22, T.CONTENT_W*0.22])
     bio_table.setStyle(_std_table_style())
     for i, row in enumerate(bio_data[1:], 1):
-        if row[3] in ("ABSENT", "COMPOSITE ILLUMINATION", "GAN SMOOTHED", "MISMATCH"):
+        if row[3] in ("IRREGULAR PUPIL", "COMPOSITE ILLUMINATION", "OVER-SMOOTHED", "MISSING REFLECTIONS"):
             bio_table.setStyle(TableStyle([("TEXTCOLOR", (3, i), (3, i), T.RED_ALERT),
                                             ("FONTNAME",  (3, i), (3, i), T.FONT_BOLD)]))
     story.append(bio_table)
@@ -922,7 +944,7 @@ def _build_metadata_reference(ctx, styles):
         ["Field", "Value", "Flag"],
         ["EXIF Camera Present",     str(ctx.get("exif_camera_present", "N/A")),
          "YES" if not ctx.get("exif_camera_present", True) else ""],
-        ["ELA Chi²",                f"{ctx.get('ela_chi2', 'N/A')}",
+        ["ELA Chi²",                _fmt(ctx.get('ela_chi2', 'N/A')),
          "YES" if float(ctx.get("ela_chi2", 0) or 0) > 200 else ""],
         ["Thumbnail Mismatch",      str(ctx.get("thumbnail_mismatch", "N/A")),
          "YES" if ctx.get("thumbnail_mismatch") else ""],
@@ -931,16 +953,18 @@ def _build_metadata_reference(ctx, styles):
         ["Software Tag",            str(ctx.get("software_tag", "")) or "—", ""],
         ["JPEG Quantisation Anomaly", str(ctx.get("jpeg_quantisation_anomaly", "N/A")),
          "YES" if ctx.get("jpeg_quantisation_anomaly") else ""],
-        ["Cosine Dist to Authentic", str(ctx.get("cosine_dist_authentic", "N/A")),
+        ["Cosine Dist to Authentic", _fmt(ctx.get("cosine_dist_authentic", "N/A")),
          "HIGH" if float(ctx.get("cosine_dist_authentic", 0) or 0) > 0.40 else ""],
-        ["Cosine Dist to Fake Set", str(ctx.get("cosine_dist_fake", "N/A")), ""],
-        ["FaceNet Distance",        str(ctx.get("facenet_dist", "N/A")), ""],
-        ["ArcFace Distance",        str(ctx.get("arcface_dist", "N/A")), ""],
-        ["3DMM Shape Distance",     str(ctx.get("shape_3dmm_dist", "N/A")), ""],
+        ["Cosine Dist to Fake Set", _fmt(ctx.get("cosine_dist_fake", "N/A")), ""],
+        ["FaceNet Distance",        _fmt(ctx.get("facenet_dist", "N/A")), ""],
+        ["ArcFace Distance",        _fmt(ctx.get("arcface_dist", "N/A")), ""],
+        ["3DMM Shape Distance",     _fmt(ctx.get("shape_3dmm_dist", "N/A")), ""],
         ["Reference Verdict",       str(ctx.get("reference_verdict", "N/A")), ""],
     ]
     col_w = [T.CONTENT_W * 0.45, T.CONTENT_W * 0.40, T.CONTENT_W * 0.15]
-    meta_table = Table(meta_data, colWidths=col_w)
+    meta_table_data = [[_p(cell, styles["table_header"] if i == 0 else styles["table_cell"])
+                         for cell in row] for i, row in enumerate(meta_data)]
+    meta_table = Table(meta_table_data, colWidths=col_w)
     meta_table.setStyle(_std_table_style())
     for i, row in enumerate(meta_data[1:], 1):
         if row[2] in ("YES", "HIGH"):
@@ -1007,7 +1031,9 @@ def _build_fusion(ctx, styles):
         ["Decision Threshold",   str(ctx.get("decision_threshold", "0.70")),
          "≥ 0.70 → DEEPFAKE  |  ≤ 0.35 → AUTHENTIC"],
     ]
-    stats_table = Table(stats_data,
+    stats_table_data = [[_p(cell, styles["table_header"] if i == 0 else styles["table_cell"])
+                         for cell in row] for i, row in enumerate(stats_data)]
+    stats_table = Table(stats_table_data,
                         colWidths=[T.CONTENT_W*0.28, T.CONTENT_W*0.17, T.CONTENT_W*0.55])
     stats_table.setStyle(_std_table_style())
     story.append(stats_table)
@@ -1026,8 +1052,16 @@ def _build_narrative(ctx, styles):
     story.append(Spacer(1, 3 * mm))
 
     narrative = ctx.get("narrative_text", "")
+    # Wrap narrative text inside a bordered box so no text floats outside
+    boxed_body_style = ParagraphStyle(
+        "boxed_body", parent=styles["body"],
+        borderPadding=(8, 10, 8, 10),
+        borderColor=T.CYAN_DIM, borderWidth=0.8,
+        backColor=colors.HexColor("#F9FAFB"),
+        leftIndent=6, rightIndent=6,
+    )
     if narrative:
-        story.append(Paragraph(narrative, styles["body"]))
+        story.append(Paragraph(narrative, boxed_body_style))
     else:
         # Auto-generated fallback summary
         decision = ctx.get("decision", "UNCERTAIN")
@@ -1071,7 +1105,7 @@ def _build_narrative(ctx, styles):
                 "is drawn."
             )
 
-        story.append(Paragraph(auto_text, styles["body"]))
+        story.append(Paragraph(auto_text, boxed_body_style))
 
     story.append(Spacer(1, 4 * mm))
     return story
@@ -1316,20 +1350,13 @@ if __name__ == "__main__":
         "lip_thickness_ratio":  0.22,
         "neck_face_boundary":   "sharp_edge",
         "geometry_anomaly_score": 0.884,
-        # Frequency
-        "fft_mid_anomaly_db":      9.4,
-        "fft_high_anomaly_db":     13.3,
-        "fft_ultrahigh_anomaly_db": 15.6,
-        "gan_probability":         0.967,
-        "upsampling_grid_detected": True,
+        # Frequency (FreqNet)
+        "freqnet_fake_probability": 0.912,
         "frequency_anomaly_score":  0.912,
         # Texture
-        "forehead_cheek_emd":  0.061,
-        "cheek_jaw_emd_l":     0.193,
-        "cheek_jaw_emd_r":     0.211,
-        "periorbital_nasal_emd": 0.072,
-        "lip_chin_emd":        0.148,
-        "neck_face_emd":       0.274,
+        "jaw_emd":             0.193,
+        "neck_emd":            0.274,
+        "cheek_emd":           0.211,
         "lbp_uniformity":      0.51,
         "seam_detected":       True,
         "texture_anomaly_score": 0.895,
@@ -1345,10 +1372,10 @@ if __name__ == "__main__":
         "zone_gan_probability":      0.93,
         "vlm_anomaly_score":         0.931,
         # Biological
-        "rppg_snr":             0.09,
-        "corneal_deviation_deg": 14.3,
-        "micro_texture_var":    0.012,
-        "vascular_pearson_r":   0.41,
+        "pupil_biou":            0.42,
+        "corneal_reflex_iou":    0.08,
+        "pupil_solidity":        0.78,
+        "reflection_count":      2,
         "biological_anomaly_score": 0.826,
         # Metadata
         "jpeg_quantisation_anomaly": True,

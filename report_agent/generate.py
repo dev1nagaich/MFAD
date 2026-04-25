@@ -47,7 +47,7 @@ from report_agent.template import build_report
 #  Falls back to empty string so template.py uses its auto-text.
 # ══════════════════════════════════════════════════════════════
 
-def _call_ollama(prompt: str, model: str = "mistral") -> str:
+def _call_ollama(prompt: str, model: str = "gpt-oss:20b") -> str:
     """
     Send a prompt to Mistral-7B running locally via Ollama.
 
@@ -141,15 +141,13 @@ def _build_prompt(ctx: dict) -> str:
     ear         = ctx.get("ear_alignment_px",            "N/A")
     neck_bound  = ctx.get("neck_face_boundary",          "N/A")
 
-    # §5.2 Frequency
-    fft_mid     = ctx.get("fft_mid_anomaly_db",          "N/A")
-    fft_high    = ctx.get("fft_high_anomaly_db",         "N/A")
-    fft_ultra   = ctx.get("fft_ultrahigh_anomaly_db",    "N/A")
-    gan_prob    = float(ctx.get("gan_probability",       0))
-    grid        = ctx.get("upsampling_grid_detected",    False)
+    # §5.2 Frequency (FreqNet)
+    freqnet_prob = float(ctx.get("freqnet_fake_probability", 0))
 
     # §5.3 Texture
-    neck_emd    = ctx.get("neck_face_emd",               "N/A")
+    jaw_emd     = ctx.get("jaw_emd",                     "N/A")
+    neck_emd    = ctx.get("neck_emd",                    "N/A")
+    cheek_emd   = ctx.get("cheek_emd",                   "N/A")
     lbp         = ctx.get("lbp_uniformity",              "N/A")
     seam        = ctx.get("seam_detected",               False)
 
@@ -159,11 +157,11 @@ def _build_prompt(ctx: dict) -> str:
     vlm_caption = ctx.get("vlm_caption",                 "N/A")
     saliency    = ctx.get("saliency_score",              "N/A")
 
-    # §5.5 Biological
-    rppg        = ctx.get("rppg_snr",                    "N/A")
-    corneal     = ctx.get("corneal_deviation_deg",       "N/A")
-    micro_tex   = ctx.get("micro_texture_var",           "N/A")
-    vascular    = ctx.get("vascular_pearson_r",          "N/A")
+    # §5.5 Biological (single-image pupil/corneal geometry)
+    pupil_biou   = ctx.get("pupil_biou",         "N/A")
+    corneal_iou  = ctx.get("corneal_reflex_iou", "N/A")
+    pupil_solid  = ctx.get("pupil_solidity",     "N/A")
+    refl_count   = ctx.get("reflection_count",   "N/A")
 
     # §5.6 + §7 Metadata
     exif        = ctx.get("exif_camera_present",         False)
@@ -190,28 +188,26 @@ Facial Geometry (§5.1):
   Ear alignment: {ear} px  [authentic: below 3 px]
   Neck-face boundary: {neck_bound}  [authentic: smooth]
 
-Frequency and GAN Analysis (§5.2):
-  FFT mid-band anomaly (16-50 cycles/px): {fft_mid} dB
-  FFT high-band anomaly (51-100 cycles/px): {fft_high} dB
-  FFT ultra-high band anomaly (above 100 cycles/px): {fft_ultra} dB
-  GAN probability from EfficientNet-B4 FaceForensics++ v3: {gan_prob * 100:.1f}%
-  Upsampling grid artefact detected: {grid}
+FreqNet Deepfake Detection (§5.2):
+  FreqNet fake probability: {freqnet_prob * 100:.1f}%  [>50% = deepfake signal]
 
 Texture Consistency (§5.3):
-  Neck-to-face boundary EMD: {neck_emd}  [authentic below 0.08; seam threshold 0.15]
-  LBP uniformity: {lbp}  [authentic above 0.85]
+  Jaw boundary EMD: {jaw_emd}
+  Neck-to-face EMD: {neck_emd}
+  Cheek L/R EMD: {cheek_emd}
+  LBP uniformity: {lbp}
   Seam detected: {seam}
 
 VLM Explainability (§5.4):
-  BLIP-2 verdict: {vlm_verdict}  [confidence: {vlm_conf * 100:.1f}%]
+  LLaVA-1.5-7b verdict: {vlm_verdict}  [confidence: {vlm_conf * 100:.1f}%]
   Saliency score: {saliency}
-  BLIP-2 caption: {vlm_caption}
+  LLaVA-1.5-7b caption: {vlm_caption}
 
-Biological Plausibility (§5.5):
-  rPPG cardiac SNR: {rppg}  [authentic above 0.45]
-  Corneal highlight deviation: {corneal} degrees  [authentic below 5 degrees]
-  Perioral micro-texture variance: {micro_tex}  [authentic mean approximately 0.031]
-  Vascular Pearson r: {vascular}  [authentic above 0.88]
+Biological Plausibility (§5.5 — single-image pupil/corneal geometry):
+  Pupil boundary IoU (BIoU): {pupil_biou}  [authentic above 0.55]
+  Corneal reflection L/R IoU: {corneal_iou}  [authentic above 0.15]
+  Pupil contour solidity: {pupil_solid}  [authentic above 0.90]
+  Corneal reflection pixel count: {refl_count}  [authentic: >= 4]
 
 Metadata and Reference Comparison (§5.6 + §7):
   EXIF camera metadata present: {exif}
@@ -240,7 +236,7 @@ Write only the two paragraphs separated by one blank line. Nothing else.
     return prompt
 
 
-def _generate_narrative(ctx: dict, model: str = "mistral") -> str:
+def _generate_narrative(ctx: dict, model: str = "gpt-oss:20b") -> str:
     """
     Generate narrative text for the report using Mistral-7B.
 
@@ -300,7 +296,7 @@ class ReportGenerator:
     ANALYST_NAME  = "To be configured in deployment"
     LAB_ACCREDIT  = "MFAD Forensic AI Laboratory"
     REPORTS_DIR   = "reports"
-    OLLAMA_MODEL  = "mistral"   # or "mistral:7b-instruct" for the instruction-tuned version
+    OLLAMA_MODEL  = "gpt-oss:20b"   # Must match a model available on the local Ollama server
 
     COMPLIANCE_STANDARDS = [
         "ISO/IEC 27037:2012",

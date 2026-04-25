@@ -31,27 +31,10 @@
     "fallback_to_dlib": true
   },
   "frequency_agent": {
-    "image_size": 224,
-    "fft_bands": {
-      "low_pct": 0.15,
-      "mid_pct": 0.5,
-      "high_pct": 0.75
-    },
-    "fft_thresholds": {
-      "mid_expected_offset": -24.1,
-      "high_expected_offset": -36.6,
-      "ultra_expected_offset": -55.0,
-      "normalization_factor": 10.0
-    },
-    "dct_thresholds": {
-      "real_hf_ratio_min": 0.08,
-      "fake_hf_ratio_max": 0.35,
-      "block_size": 8
-    },
-    "submethod_weights": {
-      "fft": 0.55,
-      "dct": 0.45
-    }
+    "model_path": "models/4-classes-freqnet-v2.pth",
+    "resize": 256,
+    "crop": 224,
+    "device": "auto"
   },
   "geometry_agent": {
     "symmetry_weight": 0.35,

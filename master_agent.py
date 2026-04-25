@@ -95,6 +95,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("master_agent")
 
+# ── Ollama model name (must match a model available on the local Ollama server) ─
+_OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  AGENT TOOL WRAPPERS
@@ -155,38 +158,76 @@ def geometry_tool(image_path: str, face_bbox: list) -> dict:
 
 
 @tool
-def frequency_tool(image_path: str) -> dict:
+def frequency_tool(image_path: str, face_crop_path: str = "") -> dict:
     """
-    FFT radial spectrum + SVM classifier. Returns fft_mid_anomaly_db,
-    fft_high_anomaly_db, svm_fake_probability, anomaly_score.
-
-    NOTE: frequency_agent.py handles its own face detection and
-    preprocessing internally. Pass the raw image path directly.
+    FreqNet deep-learning frequency-domain deepfake detector.
+    Returns freqnet_fake_probability and anomaly_score.
 
     Args:
-        image_path: absolute path to original image.
+        image_path:     Absolute path to the original image (always required).
+        face_crop_path: Optional path to face crop from preprocessing_agent.
+                        If provided, FreqNet scores the crop instead of the
+                        raw image — recommended for FF++ and similar datasets.
+                        Leave empty to use the raw image directly.
     """
     from agents.frequency_agent import run
 
-    result = run({"input_type": "image", "path": image_path})
+    result = run({
+        "input_type":     "image",
+        "path":           image_path,
+        "face_crop_path": face_crop_path,
+    })
     return result
 
 
 @tool
 def texture_tool(image_path: str, face_bbox: list) -> dict:
     """
-    LBP + Gabor + Earth Mover's Distance seam detection across face zones.
-    Returns jaw_emd, neck_emd, cheek_emd, lbp_uniformity, seam_detected,
-    zone_scores, anomaly_score.
+    Advanced texture forensics: TAD (Texture & Artifact Decomposition) + NPR.
+    
+    Per-zone analysis: EMD-based uniformity, LBP micro-texture variance, 
+    NPR upsampling artifacts, Gabor texture, boundary seams, color uniformity.
+    
+    Returns: jaw_emd, neck_emd, cheek_emd, lbp_uniformity, seam_detected,
+    zone_scores, zone_results (with per-zone detail), gram_distances, 
+    multi_scale_consistency, texture_fake_probability, is_fake, anomaly_score.
 
     Args:
         image_path: absolute path to original image.
         face_bbox:  [x1, y1, x2, y2] from preprocessing.
     """
-    from agents.texture import run_texture_agent
-
-    result = run_texture_agent(image_path=image_path, face_bbox=face_bbox)
-    return result.model_dump()
+    from agents.texture_agent import TextureAgent, BoundingBox
+    from PIL import Image
+    
+    try:
+        # Load image
+        image = Image.open(image_path).convert('RGB')
+        
+        # Convert bbox to BoundingBox object
+        bbox = BoundingBox(
+            x1=int(face_bbox[0]),
+            y1=int(face_bbox[1]),
+            x2=int(face_bbox[2]),
+            y2=int(face_bbox[3])
+        )
+        
+        # Run texture analysis
+        agent = TextureAgent()
+        result = agent.analyze(image, bbox)
+        
+        # Return as dict for LangChain compatibility
+        return result.to_dict()
+    
+    except Exception as e:
+        log.error(f"Texture tool error: {e}", exc_info=True)
+        import traceback
+        return {
+            "anomaly_score": 0.5,
+            "error": str(e),
+            "texture_fake_probability": 0.5,
+            "is_fake": False,
+            "traceback": traceback.format_exc()
+        }
 
 
 @tool
@@ -332,7 +373,7 @@ def _make_registry(state) -> list[dict]:
         {
             "name":          "frequency",
             "tool":          frequency_tool,
-            "invoke_args":   {"image_path": image_path},
+            "invoke_args":   {"image_path": image_path, "face_crop_path": face_crop},
             "score_key":     "anomaly_score",
             "fusion_module": "frequency",
             "enabled":       True,
@@ -587,14 +628,14 @@ def fusion_node(state: MFADState) -> MFADState:
     for agent_name, fusion_key in direct_map.items():
         output = agent_outputs.get(agent_name, {})
         score  = output.get("anomaly_score")
-        if score is not None:
+        if score is not None and "error" not in output:
             per_module_scores[fusion_key] = float(score)
 
-    # gan_artefact: use frequency agent's gan_probability if available,
+    # gan_artefact: use FreqNet's freqnet_fake_probability if available,
     # otherwise fall back to the frequency anomaly_score
     freq_out = agent_outputs.get("frequency", {})
-    if "gan_probability" in freq_out:
-        per_module_scores["gan_artefact"] = float(freq_out["gan_probability"])
+    if "freqnet_fake_probability" in freq_out:
+        per_module_scores["gan_artefact"] = float(freq_out["freqnet_fake_probability"])
     elif "frequency" in per_module_scores:
         # If the frequency agent ran, use its score as proxy for gan_artefact too
         per_module_scores["gan_artefact"] = per_module_scores["frequency"]
@@ -671,26 +712,19 @@ def report_node(state: MFADState) -> MFADState:
         "geometry_anomaly_score": geo.get("anomaly_score"),
     })
 
-    # Frequency fields
+    # Frequency fields (FreqNet)
     freq = agent_outputs.get("frequency", {})
     ctx.update({
-        "fft_mid_anomaly_db":       freq.get("fft_mid_anomaly_db"),
-        "fft_high_anomaly_db":      freq.get("fft_high_anomaly_db"),
-        "fft_ultrahigh_anomaly_db": freq.get("fft_ultrahigh_anomaly_db"),
-        "gan_probability":          freq.get("gan_probability", freq.get("anomaly_score")),
-        "upsampling_grid_detected": freq.get("upsampling_grid_detected", False),
+        "freqnet_fake_probability": freq.get("freqnet_fake_probability"),
         "frequency_anomaly_score":  freq.get("anomaly_score"),
     })
 
     # Texture fields
     tex = agent_outputs.get("texture", {})
     ctx.update({
-        "forehead_cheek_emd":    tex.get("jaw_emd"),        # closest available
-        "cheek_jaw_emd_l":       tex.get("jaw_emd"),
-        "cheek_jaw_emd_r":       tex.get("jaw_emd"),
-        "periorbital_nasal_emd": tex.get("cheek_emd"),
-        "lip_chin_emd":          tex.get("cheek_emd"),
-        "neck_face_emd":         tex.get("neck_emd"),
+        "jaw_emd":               tex.get("jaw_emd"),
+        "neck_emd":              tex.get("neck_emd"),
+        "cheek_emd":             tex.get("cheek_emd"),
         "lbp_uniformity":        tex.get("lbp_uniformity"),
         "seam_detected":         tex.get("seam_detected"),
         "texture_anomaly_score": tex.get("anomaly_score"),
@@ -714,10 +748,10 @@ def report_node(state: MFADState) -> MFADState:
     # Biological fields
     bio = agent_outputs.get("biological", {})
     ctx.update({
-        "rppg_snr":               bio.get("rppg_snr"),
-        "corneal_deviation_deg":  bio.get("corneal_deviation_deg"),
-        "micro_texture_var":      bio.get("micro_texture_var"),
-        "vascular_pearson_r":     bio.get("vascular_pearson_r"),
+        "pupil_biou":              bio.get("pupil_biou"),
+        "corneal_reflex_iou":      bio.get("corneal_reflex_iou"),
+        "pupil_solidity":          bio.get("pupil_solidity"),
+        "reflection_count":        bio.get("reflection_count"),
         "biological_anomaly_score": bio.get("anomaly_score"),
     })
 
@@ -764,7 +798,7 @@ def report_node(state: MFADState) -> MFADState:
 
     # ── LLM narrative (Mistral-7B via Ollama) ─────────────────────────────
     try:
-        llm = ChatOllama(model="mistral", temperature=0.1)
+        llm = ChatOllama(model=_OLLAMA_MODEL, temperature=0.1)
         system_msg = SystemMessage(content=(
             "You are a senior digital forensics analyst. "
             "Write in precise, court-admissible technical language. "
@@ -784,7 +818,7 @@ VLM caption : {ctx.get('vlm_caption', 'N/A')}
 Key findings:
   Metadata  : ELA chi2={ctx.get('ela_chi2')} | PRNU absent={ctx.get('prnu_absent')}
   Geometry  : symmetry={ctx.get('symmetry_index')} | jaw_dev={ctx.get('jaw_curvature_deg')} deg
-  Biological: corneal_dev={ctx.get('corneal_deviation_deg')} deg | micro_var={ctx.get('micro_texture_var')}
+  Biological: pupil_biou={ctx.get('pupil_biou')} | corneal_reflex_iou={ctx.get('corneal_reflex_iou')}
 
 Write ONLY the 3-sentence summary. No headers.
         """)

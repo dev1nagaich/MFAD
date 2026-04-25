@@ -28,7 +28,7 @@ Weights
 -------
 Sourced from published AUC values in contracts.py / §6 of reference report.
 geometry:     0.15  (§5.1)
-gan_artefact: 0.25  (§5.2 — EfficientNet-B4)
+gan_artefact: 0.25  (§5.2 — FFT+SVM)
 frequency:    0.25  (§5.2 — FFT)
 texture:      0.20  (§5.3)
 vlm:          0.25  (§5.4)
