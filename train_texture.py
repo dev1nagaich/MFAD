@@ -33,6 +33,9 @@ from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
 from tqdm import tqdm
 
 from agents.texture_agent import NPRDetector, load_npr_state_dict
+from dataset_config import (
+    TRAIN_REAL_SOURCES, TRAIN_FAKE_SOURCES, collect_class,
+)
 
 
 logging.basicConfig(
@@ -42,69 +45,35 @@ logging.basicConfig(
 log = logging.getLogger("train_texture")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Texture-relevant training subsets
-# ─────────────────────────────────────────────────────────────────────────────
-TRAIN_REAL = [
-    ("original",            "flat"),   # FF++ original frames
-    ("Flickr-Faces-HQ_10K", "flat"),
-    ("celebA-HQ_10K",       "flat"),
-]
-
-TRAIN_FAKE = [
-    ("Deepfakes",                   "flat"),
-    ("FaceSwap",                    "flat"),
-    ("FaceShifter",                 "flat"),
-    ("NeuralTextures",              "flat"),
-    ("100KFake_10K",                "flat"),
-    ("thispersondoesntexists_10K",  "flat"),
-    ("AttGAN",                      "split_fake"),  # AttGAN/<split>/1_fake/
-    ("STGAN",                       "split_fake"),
-    ("stargan",                     "split_fake"),
-]
-
-IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
-
-
-def collect_image_paths(root: Path) -> List[Path]:
-    if not root.exists():
-        return []
-    return [p for p in root.rglob("*") if p.suffix.lower() in IMAGE_EXTS]
-
-
 def build_split(dataset_root: Path, split: str) -> Tuple[List[Path], List[int]]:
-    """Returns (paths, labels). label 1=fake, 0=real."""
+    """Returns (paths, labels). label 1=fake, 0=real.
+
+    Pulls ONLY the matching class subfolder for each source — no fallback.
+    If a class folder is missing the source contributes 0 images and we log
+    a warning. This prevents silent class contamination.
+    """
     paths: List[Path] = []
     labels: List[int] = []
 
-    def add(name: str, layout: str, label: int):
-        ds_root = dataset_root / name
-        if not ds_root.exists():
-            log.warning("Dataset folder missing: %s", ds_root)
-            return
-        if layout == "flat":
-            sub = ds_root / split
-            if not sub.exists():
-                sub = ds_root
-            files = collect_image_paths(sub)
-        elif layout == "split_fake":
-            sub = ds_root / split / "1_fake"
-            if not sub.exists():
-                alt = ds_root / "1_fake"
-                sub = alt if alt.exists() else ds_root / split
-            files = collect_image_paths(sub) if sub.exists() else []
-        else:
-            files = []
-        log.info("  %-30s %-12s %s → %d images", name, layout, split, len(files))
-        paths.extend(files)
-        labels.extend([label] * len(files))
-
     log.info("REAL [%s]:", split)
-    for name, layout in TRAIN_REAL:
-        add(name, layout, label=0)
+    for name in TRAIN_REAL_SOURCES:
+        files = collect_class(dataset_root, name, split, "real")
+        if not files:
+            log.warning("  %-30s real %-5s → 0 images (path missing!)", name, split)
+        else:
+            log.info("  %-30s real %-5s → %d images", name, split, len(files))
+        paths.extend(files)
+        labels.extend([0] * len(files))
+
     log.info("FAKE [%s]:", split)
-    for name, layout in TRAIN_FAKE:
-        add(name, layout, label=1)
+    for name in TRAIN_FAKE_SOURCES:
+        files = collect_class(dataset_root, name, split, "fake")
+        if not files:
+            log.warning("  %-30s fake %-5s → 0 images (path missing!)", name, split)
+        else:
+            log.info("  %-30s fake %-5s → %d images", name, split, len(files))
+        paths.extend(files)
+        labels.extend([1] * len(files))
 
     return paths, labels
 

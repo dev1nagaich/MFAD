@@ -42,6 +42,7 @@ from sklearn.metrics import (
 from tqdm import tqdm
 
 from agents.texture_agent import NPRDetector, load_npr_state_dict
+from dataset_config import DATASETS, collect_class
 
 
 logging.basicConfig(
@@ -51,93 +52,21 @@ logging.basicConfig(
 log = logging.getLogger("texture_eval")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Dataset registry — every dataset under dataset/
-#   layout: "flat"   → images directly under <name>/<split>/
-#           "split"  → <name>/<split>/0_real/  AND  <name>/<split>/1_fake/
-#           "flat_no_split" → no train/test split, images under <name>/
-# ─────────────────────────────────────────────────────────────────────────────
-DATASETS: List[Dict] = [
-    # FF++ real
-    {"name": "original",                    "layout": "flat",         "label": 0},
-    # FF++ fakes
-    {"name": "Deepfakes",                   "layout": "flat",         "label": 1},
-    {"name": "Face2Face",                   "layout": "flat",         "label": 1},
-    {"name": "FaceSwap",                    "layout": "flat",         "label": 1},
-    {"name": "FaceShifter",                 "layout": "flat",         "label": 1},
-    {"name": "NeuralTextures",              "layout": "flat",         "label": 1},
-    {"name": "DeepFakeDetection",           "layout": "flat",         "label": 1},
-    # Faces-HQ real
-    {"name": "Flickr-Faces-HQ_10K",         "layout": "flat",         "label": 0},
-    {"name": "celebA-HQ_10K",               "layout": "flat",         "label": 0},
-    # Faces-HQ fake
-    {"name": "100KFake_10K",                "layout": "flat",         "label": 1},
-    {"name": "thispersondoesntexists_10K",  "layout": "flat",         "label": 1},
-    # CelebA (large real)
-    {"name": "celeba",                      "layout": "flat_no_split", "label": 0},
-    # Custom mixed
-    {"name": "deepdetect25",                "layout": "split"},
-    # Stable Diffusion (fake only)
-    {"name": "stable_diffusion_512",        "layout": "flat",         "label": 1},
-    {"name": "stable_diffusion_768",        "layout": "flat",         "label": 1},
-    {"name": "stable_diffusion_1024",       "layout": "flat",         "label": 1},
-    # GAN Zoo (real + fake subdirs)
-    {"name": "AttGAN",                      "layout": "split"},
-    {"name": "BEGAN",                       "layout": "split"},
-    {"name": "CramerGAN",                   "layout": "split"},
-    {"name": "InfoMaxGAN",                  "layout": "split"},
-    {"name": "MMDGAN",                      "layout": "split"},
-    {"name": "RelGAN",                      "layout": "split"},
-    {"name": "SNGAN",                       "layout": "split"},
-    {"name": "STGAN",                       "layout": "split"},
-    {"name": "stargan",                     "layout": "split"},
-    {"name": "progan",                      "layout": "split"},
-    # Extras (real + fake)
-    {"name": "whichfaceisreal",             "layout": "split"},
-    {"name": "deepfake",                    "layout": "split"},
-]
-
-IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
-
-
-def collect(root: Path) -> List[Path]:
-    if not root.exists():
-        return []
-    return [p for p in root.rglob("*") if p.suffix.lower() in IMAGE_EXTS]
-
-
-def gather_dataset(dataset_root: Path, cfg: Dict, split: str
+def gather_dataset(dataset_root: Path, name: str, has: Dict[str, bool], split: str
                    ) -> Tuple[List[Path], List[int]]:
-    name   = cfg["name"]
-    layout = cfg["layout"]
-    ds     = dataset_root / name
+    """Returns (paths, labels). label 0=real, 1=fake. Empty if both subdirs missing."""
     paths: List[Path] = []
     labels: List[int] = []
 
-    if not ds.exists():
-        return paths, labels
+    if has.get("real", False):
+        files = collect_class(dataset_root, name, split, "real")
+        paths.extend(files)
+        labels.extend([0] * len(files))
 
-    if layout == "flat":
-        sub = ds / split
-        if not sub.exists():
-            sub = ds
-        files = collect(sub)
+    if has.get("fake", False):
+        files = collect_class(dataset_root, name, split, "fake")
         paths.extend(files)
-        labels.extend([int(cfg["label"])] * len(files))
-    elif layout == "flat_no_split":
-        files = collect(ds)
-        paths.extend(files)
-        labels.extend([int(cfg["label"])] * len(files))
-    elif layout == "split":
-        for cls_dir, cls_label in [("0_real", 0), ("1_fake", 1)]:
-            sub = ds / split / cls_dir
-            if not sub.exists():
-                sub = ds / cls_dir
-            if not sub.exists():
-                continue
-            files = collect(sub)
-            paths.extend(files)
-            labels.extend([cls_label] * len(files))
+        labels.extend([1] * len(files))
 
     return paths, labels
 
@@ -275,15 +204,17 @@ def main():
     log.info("Loaded weights from %s", args.weights)
 
     per_dataset: Dict[str, Dict] = {}
+    # Aggregated over in-domain datasets only — CelebA excluded since it was
+    # never trained on (low-res 178×218, OOD).
+    AGG_EXCLUDE = {"celeba"}
     all_probs: List[np.ndarray] = []
     all_labels: List[np.ndarray] = []
     t0 = time.time()
 
-    for cfg in DATASETS:
-        name = cfg["name"]
-        paths, labels = gather_dataset(args.dataset_root, cfg, args.split)
+    for name, has in DATASETS.items():
+        paths, labels = gather_dataset(args.dataset_root, name, has, args.split)
         if not paths:
-            log.warning("[skip] %s — no images found", name)
+            log.warning("[skip] %s — no images found in %s split", name, args.split)
             per_dataset[name] = {"n": 0, "skipped": True}
             continue
 
@@ -294,8 +225,9 @@ def main():
             per_dataset[name] = {"n": 0, "skipped": True}
             continue
 
-        all_probs.append(probs)
-        all_labels.append(y)
+        if name not in AGG_EXCLUDE:
+            all_probs.append(probs)
+            all_labels.append(y)
 
         unique_classes = np.unique(y)
         if len(unique_classes) == 2:
@@ -322,6 +254,7 @@ def main():
         "split":        args.split,
         "threshold":    args.threshold,
         "elapsed_seconds": round(time.time() - t0, 2),
+        "aggregate_excluded_datasets": sorted(AGG_EXCLUDE),
         "per_dataset":  per_dataset,
         "aggregated":   aggregated,
     }
